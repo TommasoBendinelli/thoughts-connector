@@ -1,0 +1,1884 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-2.0-or-later
+"""The Thoughts connector: the Thoughts Library in ChatGPT/Claude (read) plus notes to the phone.
+
+Runs on the Thoughts server host as the systemd --user unit `thoughts-connector` (port 8095 on
+loopback) behind a public HTTPS reverse proxy at CONNECTOR_PUBLIC_URL/connector (sign-in and OAuth:
+connector_core.py).
+It talks to the Thoughts server on 127.0.0.1:8080 as its own device `connector` (token in
+THOUGHTS_CONNECTOR_TOKEN, made with `thoughts-admin create-device connector`), so its notes and
+reply feed are its own and it never shares a device sequence with the Mac or the phone.
+
+A device token can do everything, so every request goes through ALLOWED: reading the Library
+catalogue, sources, objects, projections and agent notes, creating agent notes, diary entries and
+review-card conversation links, and publishing the sources into which thoughts-cli wrote pending
+agent proposals (objects, source publications, the render check after them; never a decision), and
+adding a new note to a Project (create_document: thoughts-cli publishes the new source, sends the
+Library-project actions include_source and rename_document, check_request refusing every other
+Library-project action, and publishes the new PDF's build inputs as the Mac does, reading the
+folder's latest snapshots and checking objects with HEAD; when the PDF gets no inputs it
+unpublishes the note, since a published note without them stops every Library build, which is the
+only set_document_published allowed: published false, for a note create_document added), and
+resolving source conflicts ("Merge needed") with a version or a combination of versions of the file,
+and adding or replacing one interactive HTML page of a docs folder (add_html_page: thoughts-cli
+add-html-page uploads it and changes the folder's page list, POST /v1/html-pages; never a removal),
+moving an imported PDF to another Project (move_pdf: the Library-project action move_document),
+importing a PDF into a Project from a URL (import_pdf: POST /v1/library/url-imports; the server downloads
+it, checks it and makes the Library's Import document change), merging review cards into one when the user
+asks (merge_review_cards: thoughts-cli merge-review-cards, POST /v1/review-card-merges; the server deletes the
+other cards with their markers and gives the kept card every passage, in one transaction, as Merge cards… on
+the Mac does), moving a card onto a pending proposal's text (move_review_card: thoughts-cli asks the server to
+wait for the proposal, POST /v1/review-card-pending-moves; the server moves the card when the user accepts it),
+listing and cancelling such waiting moves (pending_card_moves, cancel_pending_card_move),
+and reading why a PDF does not build (build_status: GET /v1/render-status, /v1/builds/<id> and its
+source-diff, and the build log object).
+Nothing else (no builds, uploaded imports, decisions, receipts or inbox polling).
+After a 401 it stops for 10 minutes so a bad token cannot trip the server's per-address lockout for
+other local callers.
+
+Proposals are written by thoughts-cli (thoughts-server clients/thoughts-cli, the package thoughts_cli
+copied next to this file by deploy.sh, or THOUGHTS_CLI): a headless sync client that reads the source,
+writes the \\agentProposedEdit wrappers exactly as the desktop's thoughtsctl does and publishes the new
+source as this device, like the Mac's source publisher. Its request records (request_id replays) are
+in <state>/thoughts-cli.
+
+Notes are rendered from Markdown (with KaTeX math) to a PNG by agent_notes.py from the Thoughts
+plugin (copied next to this file by deploy.sh) with Chromium (THOUGHTS_CHROME).
+
+Commands: serve (default) | set-passphrase [--stdin] | revoke-all | status
+"""
+import asyncio
+import base64
+import hashlib
+import importlib.util
+import io
+import json
+import logging
+import os
+import re
+import sys
+import time
+import unicodedata
+import uuid
+from datetime import datetime, timedelta
+from pathlib import Path
+from typing import Annotated, Literal
+from zoneinfo import ZoneInfo
+
+from pydantic import BaseModel, ConfigDict, Field
+
+import connector_core as core
+import knowledge_profile as knowledge
+
+THOUGHTS_URL = os.environ.get("THOUGHTS_URL", "http://127.0.0.1:8080").rstrip("/")
+TOKEN_FILE = Path(os.environ.get("THOUGHTS_CONNECTOR_TOKEN", Path.home() / "connectors" / "thoughts-token"))
+DIARY_ZONE = ZoneInfo(os.environ.get("THOUGHTS_DIARY_ZONE", "Europe/Zurich"))
+DIARY_AUTHOR = os.environ.get("THOUGHTS_DIARY_AUTHOR", "user")  # the author name on diary entries
+AGENT_NOTES = Path(os.environ.get("THOUGHTS_AGENT_NOTES", Path(__file__).with_name("agent_notes.py")))
+# The directory holding the thoughts_cli package (thoughts-server clients/thoughts-cli).
+THOUGHTS_CLI = Path(os.environ.get("THOUGHTS_CLI", Path(__file__).resolve().parent))
+SERVICE = core.Service(
+    name="Thoughts", prefix="/connector", port=int(os.environ.get("THOUGHTS_CONNECTOR_PORT", "8095")),
+    state=Path(os.environ.get("THOUGHTS_CONNECTOR_STATE", Path.home() / "connectors" / "state" / "thoughts")),
+    what="your Thoughts Library and send notes to your phone")
+CACHE_TTL = 30.0
+PAUSE_AFTER_401 = 600.0
+UUID = r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"
+ALLOWED = [(method, re.compile(f"^{pattern}$")) for method, pattern in (
+    ("GET", r"/v1/library/projects"),
+    ("GET", r"/v1/sources"),
+    ("GET", r"/v1/objects/[0-9a-f]{64}"),
+    ("GET", r"/v1/projections"),
+    ("GET", r"/v1/agent-notes"),
+    ("GET", f"/v1/agent-notes/{UUID}"),
+    ("GET", f"/v1/agent-notes/{UUID}/image"),
+    ("GET", r"/v1/agent-notes/replies"),
+    ("GET", r"/v1/agent-notes/replies/[A-Za-z0-9_-]{1,128}/image"),
+    # A picture the user sent with a reply (the phone's Send with picture, from the glasses camera).
+    ("GET", r"/v1/agent-notes/replies/[A-Za-z0-9_-]{1,128}/photo"),
+    ("POST", r"/v1/agent-notes"),
+    ("GET", r"/v1/device-sequence"),
+    # add_diary_entry, link_conversation and thoughts-cli's review cards (check_request).
+    ("POST", r"/v1/operations"),
+    ("GET", r"/v1/conflicts"),
+    ("POST", f"/v1/conflicts/{UUID}/resolve"),
+    # thoughts-cli (read_source, create_proposals, revise_proposal, remove_proposal); never a decision about the
+    # user's text: the only decision claim it may send is the withdrawal of an agent proposal (check_request).
+    ("GET", r"/v1/sources/[^?#]+"),
+    ("POST", r"/v1/objects"),
+    ("POST", r"/v1/source-publications"),
+    ("POST", r"/v1/render-checks"),
+    # thoughts-cli create-document: only LIBRARY_ACTIONS (check_request).
+    ("POST", r"/v1/library/projects"),
+    # thoughts-cli create-document: the new PDF's build inputs (never another PDF's; existing ones are kept).
+    ("GET", r"/v1/build-input-snapshots/latest"),
+    ("HEAD", r"/v1/objects/[0-9a-f]{64}"),
+    ("POST", r"/v1/build-input-snapshots"),
+    # thoughts-cli create-review-card and move-review-card: the server's capabilities.
+    ("GET", r"/v1/health"),
+    # html_pages and add_html_page (thoughts-cli add-html-page): a docs folder's HTML pages; add or replace only
+    # (check_request), never a removal.
+    ("GET", r"/v1/html-pages"),
+    ("POST", r"/v1/html-pages"),
+    # build_status (thoughts-cli build-status): a PDF's render status, its build and that build's comparison.
+    ("GET", r"/v1/render-status"),
+    ("GET", f"/v1/builds/{UUID}"),
+    ("GET", f"/v1/builds/{UUID}/source-diff"),
+    # import_pdf: the server downloads a PDF from a URL and imports it into a Project (library_import_pdf_v1).
+    ("POST", r"/v1/library/url-imports"),
+    # merge_review_cards (thoughts-cli merge-review-cards): the server merges cards into one (review_card_merge_v1).
+    ("POST", r"/v1/review-card-merges"),
+    # move_review_card onto a pending proposal's text: the move waits for the proposal (review_card_pending_moves_v1);
+    # pending_card_moves, cancel_pending_card_move and get_review_card read or cancel such moves.
+    ("POST", r"/v1/review-card-pending-moves"),
+    ("GET", r"/v1/review-card-pending-moves"),
+    ("GET", f"/v1/review-card-pending-moves/{UUID}"),
+    ("POST", f"/v1/review-card-pending-moves/{UUID}/cancel"),
+)]
+# The server capability import_pdf needs, and how long its download and import may take.
+IMPORT_CAPABILITY = "library_import_pdf_v1"
+IMPORT_SECONDS = 240
+# The server capability merge_review_cards needs.
+MERGE_CAPABILITY = "review_card_merge_v1"
+# The server capability for card moves that wait for a pending proposal (move_review_card, pending_card_moves).
+PENDING_MOVES_CAPABILITY = "review_card_pending_moves_v1"
+# Operations the connector itself sends: add_diary_entry and link_conversation.
+OWN_OPERATIONS = frozenset({"logical_comment", "agent_conversation"})
+# create_document's three, and move_pdf's move_document (an imported PDF to another Project).
+LIBRARY_ACTIONS = frozenset({"include_source", "rename_document", "set_document_published", "move_document"})
+MARKER = re.compile(r"(?:<!--\s*)?\\?ReviewCardMask(?:Start|End)\{[^}]*\}\{[^}]*\}%?(?:\s*-->)?")
+INPUT = re.compile(r"\\(?:input|include|subfile)\{([^}]+)\}")
+FOLDER = re.compile(r"docs-[A-Za-z0-9_.-]+")
+logging.getLogger("pypdf").setLevel(logging.ERROR)  # malformed-but-readable PDFs warn on every read
+
+
+class ThoughtsError(RuntimeError):
+    pass
+
+
+# The rules thoughts-cli enforces before it writes (thoughts_cli guards.py, pdf_links.py), for the tool descriptions.
+PROPOSAL_RULES = """
+        Links to Library PDFs: \\PdfLink{pdfKey}{anchor}{text} opens the imported PDF whose Library filename is
+        pdfKey.pdf in ANY Project (Markdown: [text](pdfKey.pdf#anchor)); anchor is document-start or a doc-anchor:
+        name. Every note, also one in a Project's default folder, has \\PdfLink: never \\providecommand it. An old
+        \\CrossPdfLink{docs-<folder>/pdfKey}{anchor}{text} still works after the PDF moved. A PDF no Project has is
+        refused (invalid_link, with the closest filename in links[].suggestion).
+        Refused before anything is written, with the fix in the answer: proposal_in_argument (lines inside a
+        key=value argument such as \\hypersetup{...}, \\geometry{...}, package or TikZ options, or inside a [ ]
+        optional argument such as \\twocolumn[...]: select the whole command, suggested_start_line and
+        suggested_end_line); invalid_include_path; review_card_latex_unsupported (\\hyperref inside a review card's
+        answer: use \\hyperlink{label}{text} and \\hypertarget{label}{}); in Markdown unsupported_character (emoji)
+        and markdown_math_lt (a literal < in math: write \\lt). \\includegraphics{../assets/x} is written as
+        tex/assets/x (warning include_path_rewritten). To repair a brace the file never closes (or closes twice),
+        select from the line that opens the group through where it should close and give the whole corrected text:
+        accepted although the selected original does not balance (warning original_braces_balanced). When a PDF does
+        not build, call build_status first."""
+
+
+def with_rules(tool):
+    """Append PROPOSAL_RULES to a tool's description (its docstring), below its own text."""
+    tool.__doc__ = (tool.__doc__ or "").rstrip() + "\n" + PROPOSAL_RULES
+    return tool
+
+
+def check_request(method: str, route: str, body=None, created: frozenset[str] | set[str] = frozenset()) -> None:
+    """Refuse a request ALLOWED does not list, and every Library-project change but LIBRARY_ACTIONS.
+
+    set_document_published only unpublishes a note create_document added (``created``: its document ids)."""
+    if not any(method == m and pattern.match(route) for m, pattern in ALLOWED):
+        raise ThoughtsError(f"{method} {route} is not allowed for the connector")
+    if (method, route) == ("POST", "/v1/operations"):
+        operations = body.get("operations") if isinstance(body, dict) else None
+        if not isinstance(operations, list) or not all(isinstance(op, dict) and allowed_operation(op) for op in operations):
+            raise ThoughtsError("the connector may only add diary entries, link conversations, and create or move review "
+                                "cards with their source markers; the user reviews, retires and deletes cards in Thoughts")
+        return
+    if (method, route) == ("POST", "/v1/source-publications"):
+        claims = body.get("proposal_decisions") if isinstance(body, dict) else None
+        if claims is not None and (not isinstance(claims, list) or any(
+                not isinstance(claim, dict) or claim.get("action") != "withdraw" for claim in claims)):
+            raise ThoughtsError("the connector may only withdraw agent proposals; the user accepts or rejects them in Thoughts")
+        return
+    if (method, route) == ("POST", "/v1/html-pages"):
+        changes = body.get("changes") if isinstance(body, dict) else None
+        if not isinstance(changes, list) or len(changes) != 1 or not isinstance(changes[0], dict) \
+                or not isinstance(changes[0].get("sha256"), str):
+            raise ThoughtsError("the connector may only add or replace one HTML page at a time, never remove one")
+        return
+    if (method, route) != ("POST", "/v1/library/projects"):
+        return
+    action = body.get("action") if isinstance(body, dict) else None
+    if action not in LIBRARY_ACTIONS:
+        raise ThoughtsError(f"the Library-project action {action!r} is not allowed for the connector "
+                            "(only include_source and rename_document, to add a new note, and move_document, to "
+                            "move an imported PDF)")
+    if action == "set_document_published" and (body.get("published") is not False
+                                                or body.get("document_id") not in created):
+        raise ThoughtsError("set_document_published is not allowed for the connector, except to unpublish a note "
+                            "create_document added without build inputs")
+
+
+def allowed_operation(operation: dict) -> bool:
+    """One of the connector's own operations, or a card thoughts-cli creates or moves together with its
+    source markers (create-review-card, move-review-card): never a review, retirement or deletion."""
+    if operation.get("entity_type") in OWN_OPERATIONS:
+        return True
+    payload = operation.get("payload")
+    return (operation.get("entity_type") == "review_card" and isinstance(payload, dict)
+            and payload.get("source_authority") == "client-v1" and isinstance(payload.get("source_change"), dict)
+            and payload.get("status") == "approved" and "delete_source" not in payload)
+
+
+def created_documents(state: Path) -> set[str]:
+    """The notes create_document added: the document ids of thoughts-cli's create-document records."""
+    try:
+        records = json.loads((state / "thoughts-cli" / "requests.json").read_text(encoding="utf-8"))["requests"]
+    except (OSError, ValueError, KeyError, TypeError):
+        return set()
+    return {record["document_id"] for record in records.values() if isinstance(record, dict)
+            and record.get("command") == "create-document" and isinstance(record.get("document_id"), str)}
+
+
+UUID_FIELD = f"^{UUID}$"
+
+
+class ProposalFigure(BaseModel):
+    """An SVG drawing a proposal adds (thoughts-server protocol/agent-proposals.md section 11)."""
+    model_config = ConfigDict(extra="forbid")
+    name: Annotated[str, Field(pattern=r"^[a-z0-9][a-z0-9_-]{0,63}$", description="File name without .svg; the figure becomes agent-figures/<name>.svg next to the note.")]
+    svg: Annotated[str, Field(min_length=1, max_length=1048576, description="A complete self-contained SVG document (root <svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=...>); no scripts, event handlers, external links, images by URL or @import; data:image/ URIs are fine.")]
+
+
+FIGURES_FIELD = ("SVG drawings this proposal adds. Each is published with the proposal as agent-figures/<name>.svg in "
+                 "the note's folder, and the replacement must reference it: LaTeX "
+                 "\\includegraphics[width=\\linewidth]{agent-figures/<name>} (no extension; Thoughts converts it to PDF), "
+                 "Markdown ![description](agent-figures/<name>.svg). It shows in the PDF while pending; Reject removes it.")
+
+
+class ProposalEdit(BaseModel):
+    """One edit of create_proposals (thoughtsctl create-proposals)."""
+    model_config = ConfigDict(extra="forbid")
+    start_line: Annotated[int, Field(ge=1, le=2147483647, description="One-based first line of the selection, in the version read.")]
+    end_line: Annotated[int, Field(ge=1, le=2147483647, description="One-based exclusive end line; equal to start_line inserts before that line.")]
+    replacement: Annotated[str, Field(max_length=1000000, description="Proposed source text for the selection, without any proposal wrapper; empty deletes it.")]
+    explanation: Annotated[str, Field(min_length=1, max_length=100000, description="Plain-text reason why the change is needed.")]
+    figures: Annotated[list[ProposalFigure] | None, Field(default=None, max_length=20, description=FIGURES_FIELD)] = None
+
+
+def fold(text: str) -> str:
+    return "".join(c for c in unicodedata.normalize("NFKD", text) if not unicodedata.combining(c)).casefold()
+
+
+def snippet(text: str, words: list[str], width: int = 240) -> str:
+    flat = re.sub(r"\s+", " ", text).strip()
+    if len(flat) <= width:
+        return flat
+    at = max(0, fold(flat).find(words[0]) - width // 3) if words else 0
+    return ("…" if at else "") + flat[at:at + width] + ("…" if at + width < len(flat) else "")
+
+
+def clean(text: str) -> str:
+    """Source text without the review-card marker commands (they only delimit card answers)."""
+    return MARKER.sub("", text)
+
+
+class Thoughts:
+    """The Thoughts server, through ALLOWED only, with small caches (the objects are immutable)."""
+
+    def __init__(self, http, url: str = THOUGHTS_URL, token_file: Path = TOKEN_FILE, state: Path = SERVICE.state):
+        self.http, self.url, self.token_file = http, url, token_file
+        self.paused_until = 0.0
+        self.catalogue: tuple[str, dict] | None = None
+        self.cached: dict[str, tuple[float, object]] = {}
+        self.objects: dict[str, bytes] = {}
+        self.pdf_dir = state / "pdftext"
+
+    async def request(self, method: str, path: str, *, params=None, body=None, content=None, headers=None, timeout=60,
+                      refusals=False):
+        """The response; a 4xx/5xx raises ThoughtsError, except with refusals one whose JSON names an error_code."""
+        check_request(method, path, body)
+        if time.time() < self.paused_until:
+            raise ThoughtsError("the Thoughts server refused the connector's token; paused for a few minutes")
+        token = self.token_file.read_text().strip()
+        response = await self.http.request(method, self.url + path, params=params, json=body, content=content, timeout=timeout,
+                                           headers={"Authorization": "Bearer " + token, **(headers or {})})
+        if response.status_code == 401:
+            self.paused_until = time.time() + PAUSE_AFTER_401
+            core.log("thoughts: 401 for the connector's token; pausing requests for 10 minutes")
+            raise ThoughtsError("the Thoughts server refused the connector's token")
+        if response.status_code >= 400 and response.status_code != 304:
+            try:
+                answer = response.json()
+                detail = answer.get("detail")
+            except (ValueError, AttributeError):
+                answer, detail = None, response.text[:300]
+            if refusals and isinstance(answer, dict) and answer.get("error_code"):
+                return response
+            raise ThoughtsError(f"Thoughts server: {response.status_code} {detail}")
+        return response
+
+    async def ttl(self, key: str, path: str):
+        hit = self.cached.get(key)
+        if hit and time.monotonic() - hit[0] < CACHE_TTL:
+            return hit[1]
+        value = (await self.request("GET", path)).json()
+        self.cached[key] = (time.monotonic(), value)
+        return value
+
+    async def projects(self) -> list[dict]:
+        headers = {"If-None-Match": self.catalogue[0]} if self.catalogue else {}
+        response = await self.request("GET", "/v1/library/projects", headers=headers)
+        if response.status_code != 304 or not self.catalogue:
+            self.catalogue = (response.headers.get("etag", ""), response.json())
+        return self.catalogue[1]["projects"]
+
+    async def documents(self) -> dict[str, dict]:
+        """document_id -> {document_id, name, project, kind (tex|md|pdf), source_file, base, pdf_sha256, pages, published}.
+
+        A document published in any Project is published; one only some Project lists in
+        unpublished_documents is not (protocol/project-document-publication.md)."""
+        out = {}
+        projects = await self.projects()
+        for field, published in (("documents", True), ("unpublished_documents", False)):
+            for project in projects:
+                for d in project.get(field, []):
+                    source = d.get("source_file") or ""
+                    kind = "tex" if source.endswith(".tex") else "md" if source.endswith((".md", ".markdown")) else "pdf"
+                    out.setdefault(d["document_id"], {
+                        "document_id": d["document_id"], "name": d.get("name") or d.get("filename"), "project": project["name"],
+                        "kind": kind, "source_file": source or None, "base": d.get("source_project") or "",
+                        "pdf_sha256": d.get("sha256"), "pages": d.get("page_count"), "included": published,
+                        "published": published})
+        return out
+
+    async def sources(self) -> dict[str, dict]:
+        listing = await self.ttl("sources", "/v1/sources")
+        return {s["path"]: s for s in listing["sources"] if not s["deleted"]}
+
+    async def object(self, sha256: str) -> bytes:
+        if sha256 not in self.objects:
+            data = (await self.request("GET", f"/v1/objects/{sha256}", timeout=120)).content
+            if len(data) > 4 * 1024 * 1024:
+                return data  # PDFs: not kept in memory
+            if sum(map(len, self.objects.values())) > 128 * 1024 * 1024:
+                self.objects.clear()
+            self.objects[sha256] = data
+        return self.objects[sha256]
+
+    async def fresh_sources(self) -> dict[str, dict]:
+        """The source listing now, not from the cache: proposals need the current SHA-256."""
+        self.cached.pop("sources", None)
+        return await self.sources()
+
+    async def source(self, path: str) -> str | None:
+        record = (await self.sources()).get(path)
+        if record is None:
+            return None
+        return (await self.object(record["object_sha256"])).decode("utf-8", "replace")
+
+    async def document_text(self, doc: dict) -> list[str]:
+        """The document as lines: its source with \\input files inlined (tex), or its PDF's pages' text."""
+        if doc["kind"] == "pdf":
+            return [f"--- page {n} ---\n{text}" for n, text in enumerate(await self.pdf_pages(doc["pdf_sha256"]), 1)]
+        text = await self.source(doc["source_file"]) or ""
+        if doc["kind"] == "tex":
+            text = await self.inline_inputs(text, doc, depth=0)
+        return clean(text).splitlines()
+
+    async def inline_inputs(self, text: str, doc: dict, depth: int) -> str:
+        if depth > 4:
+            return text
+        sources = await self.sources()
+        folder = doc["source_file"].split("/tex/")[0] if "/tex/" in doc["source_file"] else doc["base"]
+        out, last = [], 0
+        for match in INPUT.finditer(text):
+            name = match.group(1).strip()
+            candidates = [f"{base}/{name}{ext}" for base in (folder, doc["base"]) if base for ext in ("", ".tex")]
+            path = next((c for c in candidates if c in sources), None)
+            if path is None:
+                continue
+            inner = await self.inline_inputs(await self.source(path) or "", doc, depth + 1)
+            out.append(text[last:match.start()] + f"% ---- {name} ----\n" + inner)
+            last = match.end()
+        return "".join(out) + text[last:]
+
+    async def pdf_pages(self, sha256: str) -> list[str]:
+        cache = self.pdf_dir / f"{sha256}.json"
+        if cache.exists():
+            return json.loads(cache.read_text())
+        data = await self.object(sha256)
+
+        def extract() -> list[str]:
+            from pypdf import PdfReader
+            return [(page.extract_text() or "").strip() for page in PdfReader(io.BytesIO(data)).pages]
+        pages = await asyncio.to_thread(extract)
+        core.write_atomic(cache, json.dumps(pages).encode())
+        return pages
+
+    async def review(self) -> tuple[dict, dict]:
+        """(card_id -> card payload, card_id -> [event payloads, oldest first]) from the projections."""
+        projections = (await self.ttl("projections", "/v1/projections"))["projections"]
+        cards = {p["entity_id"]: p["payload"] for p in projections if p["entity_type"] == "review_card" and not p["deleted"]}
+        events: dict[str, list] = {}
+        for p in projections:
+            if p["entity_type"] == "review_event" and not p["deleted"]:
+                events.setdefault(p["payload"].get("card_id"), []).append(p["payload"])
+        for history in events.values():
+            history.sort(key=lambda e: e.get("reviewed_at") or e.get("updated_at") or "")
+        return cards, events
+
+    async def document_feedback(self) -> dict[str, list]:
+        """document_id -> [document_feedback payloads, oldest first] from the projections (non-deleted only).
+
+        Liked/disliked passages of a document's PDF snapshot (thoughts-server protocol/document-feedback.md)."""
+        projections = (await self.ttl("projections", "/v1/projections"))["projections"]
+        out: dict[str, list] = {}
+        for p in projections:
+            payload = p.get("payload")
+            if p["entity_type"] != "document_feedback" or p["deleted"] or not isinstance(payload, dict) or payload.get("deleted"):
+                continue
+            pdf = (payload.get("anchor") or {}).get("pdf") or {}
+            if pdf.get("document_id"):
+                out.setdefault(pdf["document_id"], []).append(payload)
+        for records in out.values():
+            records.sort(key=lambda f: (created_order(f.get("created_at")), str(f.get("feedback_id") or "")))
+        return out
+
+    async def card_answer(self, card: dict) -> str | None:
+        """The text between the card's markers in its sources, or the PDF text it selected."""
+        primary = card.get("primary") or {}
+        anchor = primary.get("source_anchor") or {}
+        parts = []
+        for segment in anchor.get("segments") or []:
+            text = await self.source(segment.get("source_file", ""))
+            if not text:
+                continue
+            ident = re.escape(card.get("card_id", "")) + r"\}\{" + re.escape(str(segment.get("segment_id", "0")))
+            match = re.search(r"ReviewCardMaskStart\{" + ident + r"\}%?(.*?)(?:<!--\s*)?\\?ReviewCardMaskEnd\{" + ident + r"\}",
+                              text, re.S)
+            if match:
+                parts.append(clean(match.group(1)).strip())
+        if parts:
+            return "\n\n".join(parts)
+        if (primary.get("selected_text") or "").strip():
+            return primary["selected_text"].strip()
+        regions = primary.get("regions") or ([{"page": primary.get("page"), "rect": primary.get("rect")}] if primary.get("rect") else [])
+        if primary.get("pdf_sha256") and regions:
+            try:
+                return await self.pdf_region_text(primary["pdf_sha256"], regions) or None
+            except Exception as error:  # noqa: BLE001  (an unreadable PDF only loses the answer)
+                core.log(f"card {card.get('card_id')}: no region text ({type(error).__name__}: {error})")
+        return None
+
+    async def pdf_region_text(self, sha256: str, regions: list[dict]) -> str:
+        """The PDF text inside the card's regions (page numbers from 1, rects as page fractions from the top left)."""
+        data = await self.object(sha256)
+
+        def extract() -> str:
+            from pypdf import PdfReader
+            reader, out = PdfReader(io.BytesIO(data)), []
+            for region in regions:
+                page = reader.pages[int(region["page"]) - 1]
+                box = page.mediabox
+                width, height = float(box.width), float(box.height)
+                x0, y0, x1, y1 = region["rect"]
+                left, right = float(box.left) + x0 * width - 2, float(box.left) + x1 * width + 2
+                top, bottom = float(box.bottom) + (1 - y0) * height + 2, float(box.bottom) + (1 - y1) * height - 2
+                pieces = []
+
+                def visit(text, cm, tm, font, size):
+                    x = cm[0] * tm[4] + cm[2] * tm[5] + cm[4]
+                    y = cm[1] * tm[4] + cm[3] * tm[5] + cm[5]
+                    if text and left <= x <= right and bottom <= y <= top:
+                        pieces.append(text)
+                page.extract_text(visitor_text=visit)
+                out.append("".join(pieces).strip())
+            return "\n".join(part for part in out if part)
+        return await asyncio.to_thread(extract)
+
+
+def load_thoughts_cli():
+    """The thoughts_cli package (thoughts-server clients/thoughts-cli) from THOUGHTS_CLI."""
+    if "thoughts_cli" not in sys.modules:
+        if not (THOUGHTS_CLI / "thoughts_cli" / "__init__.py").is_file():
+            raise ThoughtsError(f"thoughts-cli is not installed (no thoughts_cli package in {THOUGHTS_CLI})")
+        sys.path.insert(0, str(THOUGHTS_CLI))
+    import thoughts_cli
+    import thoughts_cli.api
+    return thoughts_cli
+
+
+def reply_photo_captures(note: dict) -> list[str]:
+    """The glasses captures (photo.capture) of a note's replies, oldest first."""
+    captures = []
+    for reply in note.get("replies") or []:
+        photo = reply.get("photo") if isinstance(reply, dict) else None
+        if isinstance(photo, dict) and isinstance(photo.get("capture"), str) and photo["capture"]:
+            captures.append(photo["capture"])
+    return captures
+
+
+def load_agent_notes():
+    """agent_notes.py of the Thoughts plugin (render + check_image), loaded from AGENT_NOTES."""
+    spec = importlib.util.spec_from_file_location("agent_notes", AGENT_NOTES)
+    module = importlib.util.module_from_spec(spec)
+    # dataclasses (Python 3.14) look the defining module up in sys.modules
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def card_summary(card: dict, history: list, docs: dict) -> dict:
+    primary = card.get("primary") or {}
+    doc = docs.get(primary.get("document_id") or "")
+    # The card's Project document: its PDF's for a card made in an attachment.
+    owner = docs.get(primary.get("pdf_document_id") or "") or doc
+    answered = [e for e in history if e.get("rating") not in (None, "delete") and not e.get("retracted_event_id")]
+    last = answered[-1] if answered else None
+    out = {"card_id": card.get("card_id"), "question": primary.get("question"), "document_id": primary.get("document_id"),
+           "document": doc["name"] if doc else None, "page": primary.get("page"), "created_at": card.get("created_at"),
+           "reviews": len(answered)}
+    retired = retired_at(history)
+    # A card of an unpublished document is kept but not offered for review.
+    out["status"] = "retired" if retired else "unpublished" if owner and owner.get("published") is False else "active"
+    if retired:
+        out["retired_at"] = retired
+    if last:
+        out.update(last_reviewed_at=last.get("reviewed_at"), last_rating=last.get("rating"),
+                   last_tags=last.get("review_tags") or [])
+        notes = {k: v for k, v in (last.get("review_group_notes") or {}).items() if v}
+        if notes:
+            out["last_notes"] = notes
+    return out
+
+
+def waiting_text(body: dict) -> str:
+    """move_review_card's answer for a move that waits for a pending proposal."""
+    lines = [f"Card {body['card_id']} waits for the user to accept proposal {body['proposal_id']} in {body['source']}"
+             + (" (replayed: already recorded by this request_id)" if body.get("replayed") else "")
+             + f". Nothing has changed yet. When the user accepts it, Thoughts moves the card from "
+             f"{body['from_document']} into {body['document']} onto these lines, with its history; if the proposal is "
+             f"rejected or withdrawn, the card stays on {body['from_document']}. pending_move_id {body['pending_move_id']}."]
+    current = body.get("pending_move") or {}
+    if current and current.get("state") != "waiting_for_proposal":
+        lines.append(f"Now: {current['state']}" + (f" ({current['reason']})" if current.get("reason") else "")
+                     + (f": {current['message']}" if current.get("message") else "") + ".")
+    return "\n".join(lines)
+
+
+def pending_move_line(move: dict) -> str:
+    """One pending card move, for pending_card_moves and get_review_card."""
+    head = (f"- card {move.get('card_id')} into {move.get('document')} (from {move.get('from_document')}), "
+            f"proposal {move.get('proposal_id')} in {move.get('source')}: ")
+    if move.get("state") == "waiting_for_proposal":
+        return head + f"waiting for the user to accept it (pending_move_id {move.get('pending_move_id')})"
+    return head + str(move.get("state")) + (f" ({move['reason']})" if move.get("reason") else "") + (
+        f", {move['settled_at'][:10]}" if move.get("settled_at") else "")
+
+
+def deleted(history: list) -> bool:
+    return any(e.get("rating") == "delete" for e in history)
+
+
+def _when(value) -> datetime | None:
+    try:
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return parsed if parsed.tzinfo else None
+
+
+def created_order(value) -> tuple:
+    """Sort key for RFC 3339 timestamps with any offset; unparsable ones last, by their text."""
+    when = _when(value)
+    return (0, when.timestamp(), "") if when else (1, 0.0, str(value or ""))
+
+
+def feedback_summary(feedback: dict, current_pdf_sha256: str | None) -> dict:
+    """One document_feedback record as the document_feedback tool shows it (protocol/document-feedback.md 6).
+
+    snapshot is "current" when the feedback was given on the document's current PDF, "earlier" otherwise,
+    and None when the current PDF is not known (the document is not in the Library catalogue). Feedback made
+    in an HTML attachment (section 8) has no page: html_attachment names the page and its state instead."""
+    anchor = feedback.get("anchor") or {}
+    pdf = anchor.get("pdf") or {}
+    regions = pdf.get("regions") or []
+    sha = pdf.get("pdf_sha256")
+    summary = {"feedback_id": feedback.get("feedback_id"), "polarity": feedback.get("polarity"),
+               "quote": (anchor.get("quote") or {}).get("exact"), "comment": feedback.get("comment") or "",
+               "page": regions[0].get("page") if regions and isinstance(regions[0], dict) else None,
+               "pdf_sha256": sha,
+               "snapshot": None if not current_pdf_sha256 else "current" if sha == current_pdf_sha256 else "earlier",
+               "created_at": feedback.get("created_at"), "updated_at": feedback.get("updated_at"),
+               "origin": feedback.get("origin_id")}
+    # A question or another comment (section 9): it stays until resolved_at, whatever the version.
+    # A drawing (section 10) is shown as one on its page: its points are of no use to read. A text box
+    # (section 11) is its text, the comment, on its page, without its place.
+    if feedback.get("kind"):
+        summary["kind"] = feedback["kind"]
+        summary["resolved_at"] = feedback.get("resolved_at")
+    if feedback.get("view") == "html_attachment":
+        summary["html_attachment"] = {"path": (anchor.get("html_attachment") or {}).get("path"),
+                                      "page_state": anchor.get("page_state") or {}}
+    return summary
+
+
+def feedback_line(record: dict) -> str:
+    """One record of the document_feedback tool's text."""
+    place = f"HTML page {record['html_attachment']['path']}" if record.get("html_attachment") else f"p. {record['page']}"
+    what = {"question": "Question", "other": "Comment", "drawing": "Drawing", "text": "Text box"}.get(record.get("kind")) or ("Liked" if record["polarity"] == "positive" else "Disliked")
+    if record.get("resolved_at"):
+        what += " (resolved)"
+    start = f"- {what}, {place}" + (f" ({record['snapshot']} PDF)" if record["snapshot"] else "") + f", {str(record['created_at'] or '')[:10]}"
+    # A drawing has no passage to quote, and a text box is its text.
+    if record.get("kind") == "drawing":
+        return start + (f": {record['comment']}" if record["comment"] else "")
+    if record.get("kind") == "text":
+        return start + f": \u201c{record['comment']}\u201d"
+    return start + f": \u201c{record['quote']}\u201d" + (f" \u2014 {record['comment']}" if record["comment"] else "")
+
+
+# The versions of a source conflict, by read_source_conflict's names for them.
+CONFLICT_VERSIONS = {"merged": "merged_object_sha256", "server": "current_sha256", "computer": "incoming_sha256", "base": "base_sha256"}
+MERGE_MARKER = re.compile(r"^(<<<<<<<|=======|>>>>>>>)( |$)")
+PROPOSAL_ID = re.compile(r"\\agentProposedEdit(?:\[[^\]]*\])?\{([^}]*)\}")
+
+
+def merge_problem(text: str, versions: list[str]) -> str | None:
+    """Why text is no merge of versions: a merge only combines them, so that new wording stays a proposal."""
+    lines = text.split("\n")
+    if not text.strip():
+        return "merged_text is empty."
+    if any(MERGE_MARKER.match(line) for line in lines):
+        return "merged_text still has merge markers."
+    known = {line for version in versions for line in version.split("\n")}
+    new = [line for line in lines if line.strip() and line not in known]
+    if new:
+        return ("merged_text has lines that are in no version of the file, so it would change the note outside a proposal. "
+                "Keep lines of the versions as they are, then propose new wording with create_proposals. First new line: "
+                + new[0][:200])
+    return None
+
+
+def feedback_counts(records: list) -> dict:
+    liked = sum(1 for f in records if f.get("polarity") == "positive")
+    counts = {"liked": liked, "disliked": sum(1 for f in records if f.get("polarity") == "negative")}
+    open_comments = sum(1 for f in records if f.get("kind") in ("question", "other") and not f.get("resolved_at"))
+    if open_comments:
+        counts["open_comments"] = open_comments
+    return counts
+
+
+def retired_at(history: list) -> str | None:
+    """When the card was retired, or None when it is active (thoughts-server protocol/review-card-retire.md:
+    the latest retire or restore not undone, by reviewed_at then event_id, decides)."""
+    undone = {e.get("undone_event_id") for e in history if e.get("queue_action") == "undo_retire"}
+    actions = [(at, e.get("event_id") or "", e) for e in history
+               if e.get("queue_action") in ("retire", "restore") and e.get("event_id") not in undone
+               and (at := _when(e.get("reviewed_at"))) is not None]
+    if not actions:
+        return None
+    latest = max(actions, key=lambda item: item[:2])[2]
+    return latest.get("reviewed_at") if latest.get("queue_action") == "retire" else None
+
+
+def link_id(project_id: str, agent: str, conversation_id: str) -> str:
+    """The agent_conversation record id (thoughts-server protocol/agent-conversations.md 2)."""
+    return hashlib.sha256(f"{project_id}\n{agent}:{conversation_id}".encode()).hexdigest()
+
+
+def stamp_ms(when: datetime) -> str:
+    return when.astimezone(ZoneInfo("UTC")).strftime("%Y-%m-%dT%H:%M:%S.") + f"{when.microsecond // 1000:03d}Z"
+
+
+def linked_conversation(stored: dict | None, *, project_id: str, conversation_id: str, card_id: str, title: str,
+                        now: datetime) -> dict:
+    """The agent_conversation payload after an explicit link of this claude.ai chat to a review card: the record
+    created, or the stored one copied (unknown fields kept) and touched as an agent link (spec 3.2; card entry:
+    thoughts-card-agent-conversations spec 2). The chat has no URL Thoughts accepts, so conversation_url is ""."""
+    at = stamp_ms(now)
+    if stored is None:
+        record = {"schema_version": 1, "link_id": link_id(project_id, "claude", conversation_id), "project_id": project_id,
+                  "agent": "claude", "conversation_id": conversation_id, "conversation_url": "", "title": title,
+                  "title_source": "agent", "session_name": "", "linked_by": "agent", "created_at": at,
+                  "last_active_at": at, "revision": 0, "removed": False, "removed_at": None, "deleted": False}
+    else:
+        record = json.loads(json.dumps(stored))
+        record.update(title=title, title_source="agent", removed=False, removed_at=None)
+        record["last_active_at"] = max(record.get("last_active_at") or at, at)
+    previous = record.get("updated_at") or ""
+    if previous >= at:  # strictly after the stored write
+        at = stamp_ms(datetime.fromisoformat(previous.replace("Z", "+00:00")) + timedelta(milliseconds=1))
+    record.update(last_tool="link_conversation", device_name="claude.ai", updated_at=at, origin_id="connector",
+                  revision=int(record.get("revision") or 0) + 1)
+    cards = [c for c in record.get("review_cards") or [] if isinstance(c, dict)]
+    entry = next((c for c in cards if c.get("card_id") == card_id), None)
+    if entry is None:
+        cards.append({"card_id": card_id, "linked_at": at, "last_active_at": at, "linked_by": "agent", "removed": False})
+        # At most 200: drop removed ones first, then the one active longest ago, never the new one.
+        while len(cards) > 200:
+            cards.remove(min(cards[:-1], key=lambda c: (not c.get("removed"), str(c.get("last_active_at") or ""))))
+    else:
+        entry.update(removed=False, last_active_at=max(str(entry.get("last_active_at") or at), at))
+    record["review_cards"] = cards
+    return record
+
+
+INSTRUCTIONS = (
+    "The user's Thoughts Library: their notes and papers (LaTeX or Markdown sources, imported PDFs) in projects, and "
+    "the review cards they study (a question plus the marked passage as answer, and how they rated themselves: "
+    "Understanding, Recall, Interest tags). list_documents and search_library find documents; read_document reads one. "
+    "review_cards and get_review_card show cards and the user's review history; use them to see what the user knows "
+    "before explaining. Before explaining a concept or editing a passage on a topic the user may have studied, call "
+    "knowledge_profile once for that topic and calibrate: skip or compress what is solid, explain shaky and not-understood "
+    "points carefully. create_review_card makes a card from a note's passage and move_review_card moves a card on an "
+    "imported PDF into a note, only when the user asks; onto a pending proposal's proposed text it waits and moves the "
+    "card when the user accepts that proposal (pending_card_moves lists such moves). To merge review cards into one card with several passages, "
+    "when the user asks for it, call merge_review_cards once: never delete one card and edit another, or move markers "
+    "with proposals. send_note puts a picture (Markdown with $math$) on the user's phone, which they can draw on; "
+    "get_note shows their handwritten reply. add_diary_entry writes to their Diary. Library documents are never edited "
+    "directly: to suggest a change to a LaTeX or Markdown note, read it with read_source (exact lines and its source_sha256) "
+    "and call create_proposals; the user accepts or rejects each proposal in Thoughts. revise_proposal changes a pending one, "
+    "and remove_proposal withdraws a pending proposal you made (for example one that breaks the build). "
+    "create_document adds a new note to a project, only when the user asks for a new note. "
+    "import_pdf adds a paper to a project from its URL (the Thoughts server downloads it, as Import document in the "
+    "Library does): when the user asks to add a PDF, import it yourself instead of handing them a file to import; "
+    "link it from a note with \\PdfLink{<its filename without .pdf>}{document-start}{text}. move_pdf moves an "
+    "imported PDF to another project. "
+    "An interactive HTML page (sliders, a small simulation) lives in a note's docs-* folder: add it with add_html_page, "
+    "then link it from the note in a create_proposals replacement, LaTeX \\href{thoughts-html:<path>}{text} or Markdown "
+    "[text](thoughts-html:<path>); html_pages lists a folder's pages. A link to a page the folder lacks is refused. "
+    "document_feedback lists the passages the user liked or disliked (with comments) while reading a document's PDF. "
+    "When a note's change collides with one on the user's computer, Thoughts says Merge needed and their Sync stops: "
+    "resolve it yourself with source_conflicts, read_source_conflict and resolve_source_conflict instead of asking the "
+    "user to open Thoughts. "
+    "When the user's message contains \"Review card: <id>\" (Thoughts' Copy for agent text), call link_conversation "
+    "once with that review_card and a short title, so this conversation shows on that card in Thoughts.")
+
+
+def create_app(service: core.Service = SERVICE, thoughts_url: str = THOUGHTS_URL, token_file: Path = TOKEN_FILE):
+    import httpx
+    from mcp.types import CallToolResult, ImageContent, TextContent, ToolAnnotations
+
+    ctx = core.build(service, INSTRUCTIONS)
+    mcp = ctx.mcp
+    thoughts = Thoughts(httpx.AsyncClient(), thoughts_url, token_file, service.state)
+    readonly = ToolAnnotations(readOnlyHint=True, destructiveHint=False, openWorldHint=False, idempotentHint=True)
+
+    def result(text: str, structured: dict, extra: list | None = None, error: bool = False) -> CallToolResult:
+        return CallToolResult(content=[TextContent(type="text", text=text), *(extra or [])],
+                              structuredContent=structured, isError=error)
+
+    async def find(document_id: str) -> dict:
+        docs = await thoughts.documents()
+        if document_id in docs:
+            return docs[document_id]
+        matches = [d for d in docs.values() if fold(document_id) == fold(d["name"] or "")]
+        if len(matches) == 1:
+            return matches[0]
+        raise LookupError(f"no document {document_id!r}; use list_documents or search_library for ids")
+
+    @mcp.tool(name="list_documents", title="List Library documents", annotations=readonly)
+    async def list_documents(query: str = "", project: str = "") -> CallToolResult:
+        """The Library's documents (id, name, project, kind: tex, md or pdf, pages, published), optionally only those
+        whose name or project contains query, or of one project. An unpublished document stays in its project but is
+        not built, and its review cards are not offered for review."""
+        words = fold(query).split()
+        docs = [d for d in (await thoughts.documents()).values()
+                if (not project or fold(project) in fold(d["project"])) and all(w in fold(f"{d['name']} {d['project']}") for w in words)]
+        docs.sort(key=lambda d: (fold(d["project"]), fold(d["name"] or "")))
+        rows = [{k: d[k] for k in ("document_id", "name", "project", "kind", "pages", "published")} for d in docs]
+        text = "\n".join(f"[{d['project']}] {d['name']} ({d['kind']}{'' if d['published'] else ', unpublished'}, id {d['document_id']})"
+                         for d in docs)
+        return result(f"{len(docs)} document(s):\n{text}", {"documents": rows})
+
+    @mcp.tool(name="read_document", title="Read a document", annotations=readonly)
+    async def read_document(document_id: str, from_line: int = 0, max_words: int = 10000) -> CallToolResult:
+        """A document's whole text up to max_words words (default 10000, about 25 pages; at most 20000): the
+        LaTeX/Markdown source (included files inlined, card markers removed) or, for an imported PDF, its pages'
+        text (one line per page). Longer documents continue from next_line (pass it as from_line)."""
+        doc = await find(document_id)
+        lines = await thoughts.document_text(doc)
+        budget, out, used, next_line = max(200, min(max_words, 20000)), [], 0, None
+        for index in range(max(0, from_line), len(lines)):
+            words = len(lines[index].split())
+            if out and used + words > budget:
+                next_line = index
+                break
+            out.append(lines[index])
+            used += words
+        text = "\n".join(out)
+        try:
+            counts = feedback_counts((await thoughts.document_feedback()).get(doc["document_id"], []))
+        except Exception as error:  # noqa: BLE001  (the feedback count is extra; reading never fails on it)
+            core.log(f"read_document {doc['document_id']}: no feedback count ({type(error).__name__}: {error})")
+            counts = None
+        note = (f"\nThe user marked {counts['liked']} liked and {counts['disliked']} disliked passage(s) here (document_feedback)."
+                if counts and (counts["liked"] or counts["disliked"]) else "")
+        return result(f"{doc['name']} [{doc['project']}, {doc['kind']}], lines {from_line}–{from_line + len(out)} of {len(lines)}\n{text}"
+                      + (f"\n… continues at line {next_line}" if next_line else "") + note,
+                      {"document_id": doc["document_id"], "name": doc["name"], "kind": doc["kind"], "lines": len(lines),
+                       "words": used, "text": text, "next_line": next_line, "feedback": counts})
+
+    @mcp.tool(name="document_feedback", title="Liked and disliked passages of a document", annotations=readonly)
+    async def document_feedback(document_id: str) -> CallToolResult:
+        """The user's comments on passages of a document, on its PDF or one of its HTML pages (document id or exact
+        name), oldest first. A comment is a like, a dislike, a question or something else: polarity ("positive" =
+        liked, "negative" = disliked, "neutral" = kind says "question" or "other"), then for those two resolved_at
+        when the user closed it, the quoted passage, the user's comment, the page (html_attachment instead for an HTML page), and the PDF
+        snapshot it was given on (snapshot "current" when that is the document's current PDF, "earlier" when the
+        document was rebuilt since, so pages may have moved).
+        Feedback on review card answers is shown with the card (get_review_card), not here."""
+        by_document = await thoughts.document_feedback()
+        try:
+            doc = await find(document_id)
+        except LookupError:
+            # Feedback is kept after its document left the catalogue; its id still finds it.
+            if document_id not in by_document:
+                raise
+            doc = {"document_id": document_id, "name": None, "pdf_sha256": None}
+        records = [feedback_summary(f, doc["pdf_sha256"]) for f in by_document.get(doc["document_id"], [])]
+        counts = feedback_counts(by_document.get(doc["document_id"], []))
+        lines = [feedback_line(r) for r in records]
+        name = doc["name"] or doc["document_id"]
+        waiting = f", {counts['open_comments']} open question(s) or comment(s)" if counts.get("open_comments") else ""
+        return result(f"{name}: {counts['liked']} liked, {counts['disliked']} disliked passage(s){waiting}" + ("\n" if lines else "")
+                      + "\n".join(lines),
+                      {"document_id": doc["document_id"], "name": doc["name"], "current_pdf_sha256": doc["pdf_sha256"],
+                       **counts, "total": len(records), "feedback": records})
+
+    async def open_conflict(conflict_id: str) -> dict | None:
+        records = (await thoughts.request("GET", "/v1/conflicts")).json()
+        return next((record for record in records if record["id"] == conflict_id), None)
+
+    async def conflict_text(record: dict, version: str) -> str:
+        digest = record[CONFLICT_VERSIONS[version]]
+        if not digest:
+            raise ThoughtsError(f"this conflict has no {version} version")
+        return (await thoughts.object(digest)).decode()
+
+    @mcp.tool(name="source_conflicts", title="Notes waiting for a merge", annotations=readonly)
+    async def source_conflicts() -> CallToolResult:
+        """The source files waiting for a merge: "Merge needed" in Thoughts, where a file changed on the user's
+        computer and on the server in overlapping places. The user's Sync stops at such a file until it is resolved.
+        The newest are last; an old one may belong to a device that is no longer in use. resolvable is false for a
+        conflict too old to resolve here, which stays for the user in Thoughts."""
+        records = (await thoughts.request("GET", "/v1/conflicts")).json()
+        rows = [{"conflict_id": r["id"], "path": r["path"], "conflict_count": r.get("conflict_count"),
+                 "computer_changed_at": r.get("incoming_modified_at"), "server_changed_at": r.get("current_modified_at"),
+                 "resolvable": r.get("expected_revision") is not None} for r in records]
+        lines = [f"- {r['path']} ({r['conflict_id']}), {r['conflict_count'] or '?'} overlap(s)"
+                 + ("" if r["resolvable"] else ", not resolvable here") for r in rows]
+        return result(f"{len(rows)} source file(s) waiting for a merge" + ("\n" if lines else "") + "\n".join(lines),
+                      {"conflicts": rows})
+
+    @mcp.tool(name="read_source_conflict", title="Read a merge", annotations=readonly)
+    async def read_source_conflict(
+        conflict_id: Annotated[str, Field(pattern=UUID_FIELD, description="conflict_id from source_conflicts.")],
+        version: Annotated[Literal["merged", "server", "computer", "base"], Field(description="merged: both sides with <<<<<<< markers where they overlap; server and computer: each side whole; base: the version both started from.")] = "merged",
+    ) -> CallToolResult:
+        """One version of a file waiting for a merge. Compare computer with base to see what the user changed there
+        (accepting a proposal removes its \\agentProposedEdit wrapper and leaves the new text), and server with base
+        for what changed here."""
+        record = await open_conflict(conflict_id)
+        if record is None:
+            return result("This conflict is not open any more.", {"state": "not_open"}, error=True)
+        text = await conflict_text(record, version)
+        lines = text.split("\n")
+        markers = [number for number, line in enumerate(lines, 1) if line.startswith("<<<<<<<")]
+        return result(text, {"conflict_id": conflict_id, "path": record["path"], "version": version, "lines": len(lines),
+                             "marker_lines": markers, "text": text})
+
+    @mcp.tool(name="resolve_source_conflict", title="Resolve a merge",
+              annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=True, openWorldHint=False, idempotentHint=True))
+    async def resolve_source_conflict(
+        conflict_id: Annotated[str, Field(pattern=UUID_FIELD, description="conflict_id from source_conflicts.")],
+        keep: Annotated[Literal["server", "computer", "merged"], Field(description="server or computer keeps that side whole; merged keeps merged_text.")],
+        merged_text: Annotated[str, Field(max_length=4000000, description="With keep=merged: the whole file, without merge markers, using only lines of the versions.")] = "",
+        allow_dropping_proposals: Annotated[bool, Field(description="Allow a result without pending proposals that are on the server. Only when the user decided that.")] = False,
+    ) -> CallToolResult:
+        """Resolve a file waiting for a merge, so that the user does not have to and their Sync goes on. Keep what both
+        sides did: when only one side has real changes keep that side, otherwise combine them with keep=merged. A merge
+        only combines versions: new wording goes through create_proposals afterwards, and the proposals pending on the
+        server stay unless allow_dropping_proposals is true. The file may have moved on since the conflict; the server
+        then merges this result into it. The user's computer takes the result at its next Sync and keeps its own version
+        in a backup. Tell the user what you kept. Calling again after a success reports that the conflict is closed."""
+        record = await open_conflict(conflict_id)
+        if record is None:
+            return result("This conflict is not open any more: it was already resolved.", {"state": "not_open"})
+        if record.get("expected_revision") is None:
+            return result("This conflict is too old to resolve here; it stays for the user in Thoughts.",
+                          {"accepted": False, "error_code": "not_resolvable"}, error=True)
+        server = await conflict_text(record, "server")
+        if keep == "merged":
+            versions = [server, await conflict_text(record, "computer"), await conflict_text(record, "base")]
+            if record.get("merged_object_sha256"):
+                versions.append(await conflict_text(record, "merged"))
+            problem = merge_problem(merged_text, versions)
+            if problem:
+                return result(f"Nothing was written: {problem}", {"accepted": False, "error_code": "invalid_merge"}, error=True)
+            text = merged_text
+        else:
+            text = server if keep == "server" else await conflict_text(record, "computer")
+        dropped = sorted(set(PROPOSAL_ID.findall(server)) - set(PROPOSAL_ID.findall(text)))
+        if dropped and not allow_dropping_proposals:
+            return result(f"Nothing was written: this result would remove {len(dropped)} pending proposal(s) that are on the "
+                          "server. Keep their wrappers in merged_text, or ask the user.",
+                          {"accepted": False, "error_code": "would_drop_proposals", "proposal_ids": dropped}, error=True)
+        content = text.encode()
+        digest = hashlib.sha256(content).hexdigest()
+        await thoughts.request("POST", "/v1/objects", content=content,
+                               headers={"Content-Type": "text/x-tex; charset=utf-8", "X-Content-SHA256": digest})
+        sequence = (await thoughts.request("GET", "/v1/device-sequence")).json()["next_device_sequence"]
+        stamp = datetime.now(ZoneInfo("UTC")).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+        reply = (await thoughts.request("POST", f"/v1/conflicts/{conflict_id}/resolve", body={
+            "operation_id": str(uuid.uuid4()), "device_sequence": sequence, "expected_revision": record["expected_revision"],
+            "expected_sha256": record["current_sha256"], "content_sha256": digest, "client_timestamp": stamp})).json()
+        thoughts.cached.pop("sources", None)
+        core.log(f"source conflict {conflict_id}: kept {keep}, outcome {reply.get('outcome')}")
+        data = {"path": record["path"], "keep": keep, "outcome": reply.get("outcome"), "revision": reply.get("revision"),
+                "sha256": reply.get("sha256"), "dropped_proposals": dropped}
+        if reply.get("outcome") == "conflict":
+            return result(f"{record['path']} changed again and this result overlaps it: conflict {reply.get('conflict_id')} is now "
+                          "open. Read it and resolve that one.", {**data, "conflict_id": reply.get("conflict_id")}, error=True)
+        if reply.get("outcome") not in ("applied", "merged"):
+            return result(f"Thoughts did not resolve it: {reply}", data, error=True)
+        return result(f"Resolved {record['path']} (kept {keep}, revision {reply.get('revision')}). The user's computer takes it "
+                      "at its next Sync.", data)
+
+    @mcp.tool(name="search_library", title="Search the Library", annotations=readonly)
+    async def search_library(query: str, limit: int = 20) -> CallToolResult:
+        """Documents whose name or text contains every word of query (accents and case ignored), with the first
+        matching line. Imported PDFs are searched once their text has been read (read_document) at least once."""
+        words = fold(query).split()
+        if not words:
+            return await list_documents()
+        hits = []
+        for doc in (await thoughts.documents()).values():
+            if all(w in fold(f"{doc['name']} {doc['project']}") for w in words):
+                hits.append({"document_id": doc["document_id"], "name": doc["name"], "project": doc["project"], "match": "name"})
+                continue
+            if doc["kind"] == "pdf" and not (thoughts.pdf_dir / f"{doc['pdf_sha256']}.json").exists():
+                continue
+            for index, line in enumerate(await thoughts.document_text(doc)):
+                if all(w in fold(line) for w in words):
+                    hits.append({"document_id": doc["document_id"], "name": doc["name"], "project": doc["project"],
+                                 "match": "text", "line": index, "passage": snippet(line, words)})
+                    break
+        hits.sort(key=lambda h: (h["match"] != "name", fold(h["project"]), fold(h["name"] or "")))
+        shown = hits[:max(1, min(limit, 100))]
+        text = "\n".join(f"[{h['project']}] {h['name']} (id {h['document_id']})" + (f" line {h['line']}: {h['passage']}" if "line" in h else "")
+                         for h in shown)
+        return result(f"{len(hits)} document(s):\n{text}", {"total": len(hits), "results": shown})
+
+    @mcp.tool(name="review_cards", title="Review cards", annotations=readonly)
+    async def review_cards(query: str = "", document_id: str = "", state: str = "", limit: int = 30) -> CallToolResult:
+        """The user's review cards, newest first: question, document, page, how often and how they last rated
+        themselves (tags such as 'I get it' or 'Forgot'), and status: "active", "retired" with retired_at (the
+        user took the card out of review but kept its history; it can be restored), or "unpublished" (its document
+        is unpublished in its Project, so the card is kept but not offered for review until the document is
+        published again). query filters by words in the question or document name; document_id by document; state
+        by status ("active", "retired" or "unpublished"; default all).
+        Deleted cards are left out. get_review_card has the answer and full history."""
+        if state not in ("", "active", "retired", "unpublished"):
+            raise ValueError('state must be "active", "retired", "unpublished" or empty')
+        cards, events = await thoughts.review()
+        docs = await thoughts.documents()
+        words = fold(query).split()
+        rows = []
+        for card_id, card in cards.items():
+            history = events.get(card_id, [])
+            if deleted(history):
+                continue
+            summary = card_summary(card, history, docs)
+            if document_id and summary["document_id"] != document_id:
+                continue
+            if state and summary["status"] != state:
+                continue
+            if words and not all(w in fold(f"{summary['question'] or ''} {summary['document'] or ''}") for w in words):
+                continue
+            rows.append(summary)
+        rows.sort(key=lambda r: r.get("created_at") or "", reverse=True)
+        shown = rows[:max(1, min(limit, 200))]
+        text = "\n".join(f"- {r['question']} [{r['document']}, p. {r['page']}] {r['reviews']} review(s)"
+                         + (f", last {r['last_reviewed_at'][:10]}: {', '.join(r['last_tags']) or r['last_rating']}" if r.get("last_reviewed_at") else "")
+                         + (f", retired {r['retired_at'][:10]}" if r.get("retired_at") else "")
+                         + (", unpublished document" if r["status"] == "unpublished" else "")
+                         + f" (card {r['card_id']})" for r in shown)
+        return result(f"{len(rows)} card(s):\n{text}", {"total": len(rows), "cards": shown})
+
+    async def card_pending_moves(card_id: str) -> list | None:
+        """The card's moves waiting for (or settled by) a proposal, newest first; None on a server without them."""
+        try:
+            if PENDING_MOVES_CAPABILITY not in ((await thoughts.ttl("health", "/v1/health")).get("capabilities") or []):
+                return None
+            response = await thoughts.request("GET", "/v1/review-card-pending-moves",
+                                              params={"card_id": card_id, "state": "all", "limit": 20})
+            return response.json().get("pending_moves") or []
+        except (ThoughtsError, ValueError):
+            return None
+
+    @mcp.tool(name="get_review_card", title="Review card with answer", annotations=readonly)
+    async def get_review_card(card_id: str) -> CallToolResult:
+        """One review card: question, answer (the marked passage of its source, or the PDF text it selected),
+        status ("active", or "retired" with retired_at) and every review with its tags and notes; retiring,
+        restoring and undoing a retirement appear in the history as action retire, restore and undo_retire.
+        pending_moves lists the card's moves onto a pending proposal's text (move_review_card), waiting or settled."""
+        cards, events = await thoughts.review()
+        if card_id not in cards:
+            raise LookupError(f"no review card {card_id!r}")
+        history = events.get(card_id, [])
+        summary = card_summary(cards[card_id], history, await thoughts.documents())
+        answer = await thoughts.card_answer(cards[card_id])
+        summary.update(answer=answer, deleted=deleted(history), history=[
+            {("action" if k == "queue_action" else k): e.get(k)
+             for k in ("reviewed_at", "rating", "queue_action", "review_tags", "review_group_notes") if e.get(k)}
+            for e in history])
+        moves = await card_pending_moves(card_id)
+        if moves is not None:
+            summary["pending_moves"] = moves
+        lines = [f"Q: {summary['question']}", f"Document: {summary['document']}, page {summary['page']}"
+                 + (f" (retired {summary['retired_at'][:10]})" if summary.get("retired_at") else ""),
+                 "A: " + (answer or "(a region of the PDF without text)")]
+        lines += [pending_move_line(move) for move in moves or [] if move.get("state") == "waiting_for_proposal"]
+        lines += [f"{h.get('reviewed_at', '')[:10]} {h.get('rating') or h.get('action')}: {', '.join(h.get('review_tags', []))}"
+                  + (f" — {h['review_group_notes']}" if h.get("review_group_notes") else "") for h in summary["history"]]
+        return result("\n".join(lines), summary)
+
+    @mcp.tool(name="knowledge_profile", title="Profile the user's knowledge of a topic", annotations=readonly)
+    async def knowledge_profile(
+        topic: Annotated[str, Field(min_length=1, max_length=2000, description="The concept or question, in a few words, e.g. \"GRPO advantage\".")],
+        project: Annotated[str | None, Field(max_length=2000, description="Only cards of this Library project (its name, case-insensitive).")] = None,
+        document: Annotated[str | None, Field(max_length=2000, description="Only cards of this Library document: its PDF filename, name or document ID.")] = None,
+        limit: Annotated[int, Field(strict=True, ge=1, le=200, description="At most this many matching cards are classified.")] = 40,
+    ) -> CallToolResult:
+        """What the user knows about a topic, from their review cards (read-only).
+
+        Classifies each matching card as solid, shaky, unknown (not understood) or unreviewed, from the
+        tags of its answers (the latest weighs most), lapses, interval length and how overdue it is.
+        Retired cards (taken out of review, history kept) count with their history, are never overdue, and
+        their reason ends with "retired"; deleted cards are left out.
+        Returns counts, the cards per class (question, document and a one-line reason such as
+        "last 3 answers: Correct, Memorized, Correct; interval 25 d"), a short plain-language summary,
+        and the tag-to-level mapping used (the default mapping).
+        Call it once per topic before explaining or editing, then calibrate; never change cards because of it.
+        """
+        profile = await knowledge.knowledge_profile(thoughts, topic=topic, project=project, document=document, limit=limit)
+        return result(json.dumps(profile, ensure_ascii=False), profile, error=profile.get("accepted") is False)
+
+    @mcp.tool(name="link_conversation", title="Show this conversation on a review card",
+              annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, openWorldHint=False, idempotentHint=True))
+    async def link_conversation(
+        review_card: Annotated[str, Field(pattern=UUID_FIELD, description="The review card id (the \"Review card:\" line of the user's Copy for agent text).")],
+        conversation_id: Annotated[str, Field(pattern=UUID_FIELD, description="Lowercase UUID of this conversation, the same one create_proposals takes: make one random UUID the first time in this conversation and reuse it for every later call.")],
+        title: Annotated[str, Field(max_length=200, description="Short description of what this conversation does for the card; empty uses the card's question.")] = "",
+    ) -> CallToolResult:
+        """List this conversation on a review card in Thoughts: the card shows its newest conversation above its
+        buttons and all of them in its menu, on the Mac and the phone after their next Sync. Call it once when the
+        user's message contains "Review card: <id>"; calling it again with the same conversation_id updates the entry.
+        The entry has no link back to this chat (Thoughts only opens Claude Code and Codex conversations)."""
+        cards, _ = await thoughts.review()
+        card = cards.get(review_card)
+        if card is None:
+            raise LookupError(f"no review card {review_card!r}; use review_cards for ids")
+        primary = card.get("primary") or {}
+        document_id = primary.get("pdf_document_id") or primary.get("document_id")
+        project = next((p for p in await thoughts.projects()
+                        if any(d.get("document_id") == document_id for f in ("documents", "unpublished_documents")
+                               for d in p.get(f, []))), None)
+        if project is None:
+            raise LookupError(f"the document of review card {review_card} is in no Library Project")
+        title = " ".join(title.split())[:200] or " ".join(f"Card: {primary.get('question') or review_card}".split())[:200]
+        lid = link_id(project["id"], "claude", conversation_id)
+        projections = (await thoughts.request("GET", "/v1/projections")).json()["projections"]
+        stored = next((p["payload"] for p in projections
+                       if p["entity_type"] == "agent_conversation" and p["entity_id"] == lid and not p["deleted"]), None)
+        record = linked_conversation(stored, project_id=project["id"], conversation_id=conversation_id,
+                                     card_id=review_card, title=title, now=datetime.now(ZoneInfo("UTC")))
+        sequence = (await thoughts.request("GET", "/v1/device-sequence")).json()["next_device_sequence"]
+        operation = {"operation_id": str(uuid.uuid4()), "device_sequence": sequence, "entity_type": "agent_conversation",
+                     "entity_id": lid, "collection": "agent-conversations", "base_revision": record["revision"] - 1,
+                     "client_timestamp": record["updated_at"], "payload": record}
+        response = (await thoughts.request("POST", "/v1/operations", body={"operations": [operation]})).json()
+        outcome = next(iter(response.get("results") or []), {}).get("outcome")
+        if outcome not in ("applied", "duplicate"):
+            raise ThoughtsError(f"Thoughts did not store the link (outcome {outcome}); try again")
+        core.log(f"conversation linked to card {review_card}: {title!r}")
+        return result(f"This conversation now shows on the card \"{primary.get('question')}\" ({project['name']}) as "
+                      f"\"{title}\"; the Mac and phone show it after their next Sync.",
+                      {"link_id": lid, "project_id": project["id"], "project_name": project["name"],
+                       "review_card_id": review_card, "conversation_id": conversation_id, "title": title,
+                       "conversation_url": ""})
+
+    notes_ro = ToolAnnotations(readOnlyHint=True, destructiveHint=False, openWorldHint=False)
+
+    @mcp.tool(name="list_notes", title="Notes sent to the phone", annotations=notes_ro)
+    async def list_notes(document_id: str = "", review_card_id: str = "", limit: int = 20) -> CallToolResult:
+        """Notes sent to the user's phone (by any agent), newest first, with their reply counts."""
+        params = {"limit": max(1, min(limit, 100))}
+        if document_id:
+            params["document_id"] = document_id
+        if review_card_id:
+            params["review_card_id"] = review_card_id
+        notes = (await thoughts.request("GET", "/v1/agent-notes", params=params)).json()["notes"]
+        rows = [{"note_id": n["note_id"], "title": n["title"], "created_at": n["created_at"], "sender": n["sender_device_id"],
+                 "opened": bool(n.get("opened_at")), "replies": len(n.get("replies") or []),
+                 # Glasses captures the user sent with a reply: that reply's agent answers them, not a watcher.
+                 "photo_captures": reply_photo_captures(n)} for n in notes]
+        text = "\n".join(f"- {r['created_at'][:16]} {r['title']} ({r['replies']} repl{'y' if r['replies'] == 1 else 'ies'}, id {r['note_id']})"
+                         + (f" with photo {', '.join(r['photo_captures'])}" if r["photo_captures"] else "") for r in rows)
+        return result(f"{len(rows)} note(s):\n{text}", {"notes": rows})
+
+    @mcp.tool(name="get_note", title="A note and the user's replies", annotations=notes_ro)
+    async def get_note(note_id: str, wait_for_reply_s: int = 0, include_note_image: bool = False) -> CallToolResult:
+        """One note with the user's replies as images (what they drew or wrote on the phone, and a photo from their
+        glasses when they used Send with picture). wait_for_reply_s (at most 45) waits for a first reply to a note
+        this connector sent; while it waits the phone tells the user an agent is listening."""
+        if not re.fullmatch(UUID, note_id):
+            raise LookupError("note_id must be a note's UUID")
+        note = (await thoughts.request("GET", f"/v1/agent-notes/{note_id}")).json()
+        note = note.get("note", note)
+        if wait_for_reply_s > 0 and not note.get("replies"):
+            await thoughts.request("GET", "/v1/agent-notes/replies",
+                                   params={"note_id": note_id, "wait": min(45, wait_for_reply_s), "listen": "true"}, timeout=60)
+            note = (await thoughts.request("GET", f"/v1/agent-notes/{note_id}")).json()
+            note = note.get("note", note)
+        images = []
+        if include_note_image:
+            data = (await thoughts.request("GET", f"/v1/agent-notes/{note_id}/image")).content
+            images.append(ImageContent(type="image", data=base64.b64encode(data).decode(), mimeType=note.get("media_type", "image/png")))
+        replies = []
+        for reply in note.get("replies") or []:
+            photo = reply.get("photo") if isinstance(reply.get("photo"), dict) else None
+            replies.append({**{k: reply.get(k) for k in ("reply_id", "created_at", "message", "stroke_count")},
+                            "photo_capture": photo.get("capture") if photo else None, "has_photo": photo is not None})
+            if reply.get("image_url"):
+                data = (await thoughts.request("GET", f"/v1/agent-notes/replies/{reply['reply_id']}/image")).content
+                images.append(ImageContent(type="image", data=base64.b64encode(data).decode(), mimeType=reply.get("media_type") or "image/png"))
+            if photo:
+                data = (await thoughts.request("GET", f"/v1/agent-notes/replies/{reply['reply_id']}/photo")).content
+                images.append(ImageContent(type="image", data=base64.b64encode(data).decode(), mimeType=photo.get("media_type") or "image/jpeg"))
+        summary = {"note_id": note_id, "title": note.get("title"), "message": note.get("message"),
+                   "opened_at": note.get("opened_at"), "replies": replies}
+        text = (f"{note.get('title')}: {len(replies)} repl{'y' if len(replies) == 1 else 'ies'}"
+                + "".join(f"\n- {r['created_at'][:16]}" + (f": {r['message']}" if r.get("message") else "")
+                          + (f" [with a photo from the glasses: {r['photo_capture'] or 'attached'}; act on the words with it]"
+                             if r["has_photo"] else "") for r in replies))
+        return result(text, summary, images)
+
+    @mcp.tool(name="add_diary_entry", title="Add a diary entry",
+              annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, openWorldHint=False, idempotentHint=False))
+    async def add_diary_entry(text: str) -> CallToolResult:
+        """Add an entry to the user's Thoughts Diary (the Diary tab on the phone and desktop), timestamped now.
+        Use this when the user asks to note something in their diary or journal. Write the entry in the user's
+        own first-person words, close to what they said."""
+        now = datetime.now(DIARY_ZONE)
+        stamp = now.astimezone(ZoneInfo("UTC")).strftime("%Y-%m-%dT%H:%M:%S.") + f"{now.microsecond // 1000:03d}Z"
+        entry_id = f"thoughts-{uuid.uuid4()}"
+        sequence = (await thoughts.request("GET", "/v1/device-sequence")).json()["next_device_sequence"]
+        payload = {
+            "schema_version": 1, "comment_id": entry_id, "thread_root_id": entry_id, "parent_id": None,
+            "revision": 1, "created_at": stamp, "updated_at": stamp, "content_updated_at": stamp,
+            "origin_id": "connector", "author": DIARY_AUTHOR, "contents": text.strip(), "subtype": "Note",
+            "priority": "normal", "deleted": False, "project": None, "origin": None,
+            "scope": {"state": "standalone"},
+            "entry_kind": "diary", "diary_at": now.isoformat(timespec="seconds"), "diary_zone_id": DIARY_ZONE.key,
+        }
+        operation = {"operation_id": str(uuid.uuid4()), "device_sequence": sequence,
+                     "entity_type": "logical_comment", "entity_id": entry_id, "collection": "comments",
+                     "base_revision": 0, "client_timestamp": stamp, "payload": payload}
+        await thoughts.request("POST", "/v1/operations", body={"operations": [operation]})
+        core.log(f"diary entry added: {entry_id}")
+        return result(f"Added to the Diary ({now.strftime('%d.%m.%Y %H:%M')}). It appears on the phone and desktop after their next Sync.",
+                      {"entry_id": entry_id, "diary_at": payload["diary_at"]})
+
+    @mcp.tool(name="send_note", title="Send a note to the phone",
+              annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, openWorldHint=False, idempotentHint=False))
+    async def send_note(title: str, markdown: str, message: str = "", document_id: str = "", review_card_id: str = "") -> CallToolResult:
+        """Put a note on the user's phone: markdown (headings, lists, tables, $inline$ and $$display$$ math) rendered
+        as a phone-width picture the user can draw on. Optionally tie it to a document or review card. Use
+        get_note with wait_for_reply_s to see their answer."""
+        notes = load_agent_notes()
+        rendered = await asyncio.to_thread(notes.render, markdown=markdown)
+        body = {"note_id": str(uuid.uuid4()), "title": title[:200],
+                "image": {"media_type": "image/png", "data_base64": base64.b64encode(rendered.png).decode()},
+                "origin": {"agent": "connector"}}
+        if message:
+            body["message"] = message[:4000]
+        if document_id:
+            body["document_id"] = document_id
+        if review_card_id:
+            body["review_card_id"] = review_card_id
+        sent = (await thoughts.request("POST", "/v1/agent-notes", body=body, timeout=60)).json()
+        live = bool((sent.get("delivery") or {}).get("live"))
+        # Whether an agent here hears the user's reply (thoughts-watch-replies, or get_note waiting); servers before
+        # agent_note_listening_v1 cannot tell.
+        heard = (sent.get("reply_listening") or {}).get("state") or "unknown"
+        core.log(f"note sent: {title!r} ({'phone listening' if live else 'phone not listening'}, replies {heard})")
+        text = (f"Sent '{title}' (note {body['note_id']}). "
+                + ("The phone is open and shows it now." if live else "The phone will show it when Thoughts is opened.")
+                + (" Nothing here is listening for the user's reply, and the phone shows them so: wait with get_note "
+                   "(wait_for_reply_s), or keep thoughts-watch-replies running as a monitor." if heard == "not_listening" else "")
+                + (" Warnings: " + "; ".join(rendered.warnings) if rendered.warnings else ""))
+        return result(text, {"note_id": body["note_id"], "phone_listening": live, "reply_listening": heard,
+                             "warnings": rendered.warnings})
+
+    async def source_path(source: str) -> str:
+        """A source path as GET /v1/sources lists it, or the main source of a document id or name."""
+        sources = await thoughts.fresh_sources()
+        if source in sources:
+            return source
+        try:
+            doc = await find(source)
+        except LookupError:
+            raise LookupError(f"no source {source!r}; give a path such as docs-x/tex/source/intro.tex or a document id") from None
+        except ThoughtsError as error:
+            # The catalogue can fail on its own (a document that does not verify); paths still work.
+            raise LookupError(f"the Library catalogue is unavailable ({error}); give the source path instead, "
+                              "e.g. docs-x/tex/source/intro.tex") from None
+        if not doc["source_file"]:
+            raise LookupError(f"{doc['name']} is an imported PDF; it has no source to propose changes to")
+        return doc["source_file"]
+
+    @mcp.tool(name="read_source", title="Read a source with line numbers", annotations=readonly)
+    async def read_source(source: str, from_line: int = 1, max_lines: int = 500) -> CallToolResult:
+        """The exact text of one LaTeX or Markdown source file with one-based line numbers, its path and its
+        source_sha256: what create_proposals and revise_proposal need. source is a source path (docs-x/tex/...)
+        or a document id or name (its main source). Unlike read_document nothing is inlined or removed; files it
+        includes are listed in includes, read them by path. Pending proposals appear as \\agentProposedEdit
+        wrappers (Markdown: thoughts:agent-proposal blocks). Long files continue from next_line."""
+        path = await source_path(source)
+        read = await asyncio.to_thread(proposal_client().read_source, path)
+        if not read.get("accepted"):
+            raise LookupError(f"cannot read {path}: {read.get('message')}")
+        text = read["text"]
+        lines = text.split("\n")
+        if lines and lines[-1] == "":
+            lines.pop()
+        first = max(1, from_line)
+        last = min(len(lines), first - 1 + max(1, min(max_lines, 2000)))
+        shown = "\n".join(f"{number:>5}| {lines[number - 1]}" for number in range(first, last + 1))
+        known = await thoughts.sources()
+        folder = path.split("/tex/")[0] if "/tex/" in path else path.rsplit("/", 1)[0]
+        includes = []
+        for match in INPUT.finditer(text):
+            name = match.group(1).strip()
+            found = next((c for c in (f"{folder}/{name}", f"{folder}/{name}.tex") if c in known), None)
+            if found and found not in includes:
+                includes.append(found)
+        next_line = last + 1 if last < len(lines) else None
+        digest = read["source_sha256"]
+        return result(f"{path} (source_sha256 {digest}), lines {first}–{last} of {len(lines)}\n{shown}"
+                      + (f"\n… continues at line {next_line}" if next_line else "")
+                      + (f"\nIncludes: {', '.join(includes)}" if includes else ""),
+                      {"source": path, "source_sha256": digest, "lines": len(lines), "from_line": first,
+                       "text": "\n".join(lines[first - 1:last]), "next_line": next_line, "includes": includes})
+
+    def proposal_client():
+        """thoughts-cli as this device, through ALLOWED, with its request records in the connector's state."""
+        cli = load_thoughts_cli()
+
+        class ConnectorApi(cli.api.ServerApi):
+            def request(self, method, path, **kwargs):
+                payload = kwargs.get("payload")
+                unpublish = isinstance(payload, dict) and payload.get("action") == "set_document_published"
+                check_request(method, path.split("?", 1)[0], payload,
+                              created_documents(service.state) if unpublish else frozenset())
+                if time.time() < thoughts.paused_until:
+                    raise ThoughtsError("the Thoughts server refused the connector's token; paused for a few minutes")
+                try:
+                    return super().request(method, path, **kwargs)
+                except cli.api.ApiError as error:
+                    if error.status == 401:
+                        thoughts.paused_until = time.time() + PAUSE_AFTER_401
+                        core.log("thoughts: 401 for the connector's token; pausing requests for 10 minutes")
+                    raise
+
+        token = token_file.read_text().strip()
+        return cli.ThoughtsClient(thoughts_url, token, state_dir=service.state / "thoughts-cli",
+                                  cache_dir=service.state / "thoughts-cli-cache",
+                                  api=ConnectorApi(thoughts_url, token))
+
+    async def author(payload: dict) -> CallToolResult:
+        try:
+            body = await asyncio.to_thread(proposal_client().run, payload)
+        except ThoughtsError as error:
+            return result(f"Nothing was written: {error}", {"accepted": False, "error_code": "not_allowed",
+                                                             "message": str(error)}, error=True)
+        if not body.get("accepted"):
+            hint = (f" The current source_sha256 is {body['current_source_sha256']}; read the source again."
+                    if body.get("current_source_sha256") else "")
+            if body.get("retryable"):  # its message says to retry with the same request_id
+                return result(f"Not confirmed ({body.get('error_code')}), it may or may not have been written: "
+                              f"{body.get('message')}", body, error=True)
+            return result(f"Nothing was written ({body.get('error_code')}): {body.get('message')}{hint}", body, error=True)
+        thoughts.cached.pop("sources", None)
+        if body.get("state") == "proposal_removed":
+            outcome = next((d.get("outcome") for d in body.get("proposal_decisions") or []), None)
+            core.log(f"proposals: withdrew {body['proposal_id']} in {body['source']} ({outcome})")
+            return result(
+                f"Withdrew proposal {body['proposal_id']} at line {body['line']} of {body['source']}"
+                + (" (replayed: already done by this request_id)" if body.get("replayed") else "")
+                + f"; its original text is restored, new source_sha256 {body['source_sha256']}. "
+                + ("Thoughts records it as withdrawn by the agent." if outcome in ("matched", "matched_late")
+                   else f"The server's decision outcome: {outcome}." if outcome else ""), body)
+        proposals = body.get("proposals") or [body]
+        lines = [f"{'Revised' if body.get('state') == 'proposal_revised' else 'Created'} {len(proposals)} pending "
+                 f"proposal(s) in {body['source']}" + (" (replayed: already written by this request_id)" if body.get("replayed") else "")
+                 + f"; new source_sha256 {body['source_sha256']}. They are not accepted; the user decides in Thoughts."]
+        lines += [f"- {p['proposal_id']} at line {p['line']}" for p in proposals]
+        lines += [f"- figure {f['path']} (referenced as {f['reference']}) for {f['proposal_id']}"
+                  for f in body.get("figures") or []]
+        lines += [f"Warning: {w['message']}" + (f" (proposal {w['proposal_index']})" if "proposal_index" in w else "")
+                  for w in body.get("warnings") or []]
+        core.log(f"proposals: {body.get('state')} {len(proposals)} in {body['source']}")
+        return result("\n".join(lines), body)
+
+    proposal_tool = ToolAnnotations(readOnlyHint=False, destructiveHint=False, openWorldHint=False, idempotentHint=True)
+
+    @mcp.tool(name="create_proposals", title="Propose edits to a note", annotations=proposal_tool)
+    @with_rules
+    async def create_proposals(
+        source: Annotated[str, Field(min_length=1, description="Source path from read_source (e.g. docs-x/tex/source/intro.tex).")],
+        expected_source_sha256: Annotated[str, Field(pattern=r"^[0-9a-f]{64}$", description="source_sha256 from read_source; a changed source is refused (source_conflict), nothing is rebased.")],
+        proposals: Annotated[list[ProposalEdit], Field(min_length=1, max_length=500, description="Edits in any order, all in lines of the version you read: do not shift line numbers for earlier edits. Ranges may touch but not overlap; at most one insertion per line boundary.")],
+        conversation_id: Annotated[str, Field(pattern=UUID_FIELD, description="Lowercase UUID of this conversation, recorded with each proposal: your Claude Code or Codex session ID if you have one; otherwise make one random UUID at the first proposal of this conversation and reuse it for every later one.")],
+        request_id: Annotated[str, Field(pattern=UUID_FIELD, description="Fresh random UUID for this call. Retry an uncertain call only with identical arguments and the same request_id; it is then answered without writing twice.")],
+    ) -> CallToolResult:
+        """Propose additions, replacements or deletions in one of the user's LaTeX or Markdown notes, as pending
+        proposals the user accepts or rejects in Thoughts (never applied by this tool). Use it whenever you would
+        change note text: notes are never edited directly. First call read_source for the exact lines and
+        source_sha256. Each proposal selects whole lines start_line..end_line (one-based, end exclusive) and gives the
+        replacement text: start_line == end_line inserts before that line (lines + 1 appends), an empty replacement
+        deletes. The explanation says why the change is needed. Write every sentence of new prose on its own line and
+        keep LaTeX braces balanced; never write \\agentProposedEdit or proposal markers yourself. Thoughts captures the
+        original text, makes the proposal IDs and timestamps, refuses overlaps with pending proposals (change those with
+        revise_proposal) and writes all proposals at once or none. The phone and Mac receive them with their next Sync.
+        A proposal can also add pictures: give it figures (complete SVG documents) and reference each one from the
+        replacement; prefer a clean SVG drawing over LaTeX picture code for diagrams."""
+        return await author({"command": "create-proposals", "source": source, "expected_source_sha256": expected_source_sha256,
+                             "proposals": [p.model_dump(exclude_none=True) for p in proposals],
+                             "conversation_id": conversation_id, "request_id": request_id})
+
+    @mcp.tool(name="revise_proposal", title="Revise a pending proposal", annotations=proposal_tool)
+    @with_rules
+    async def revise_proposal(
+        source: Annotated[str, Field(min_length=1, description="Source path from read_source.")],
+        expected_source_sha256: Annotated[str, Field(pattern=r"^[0-9a-f]{64}$", description="source_sha256 from read_source.")],
+        proposal_id: Annotated[str, Field(pattern=r"^[a-z0-9][a-z0-9._:-]{0,127}$", description="ID of the pending proposal (the first argument of its wrapper, or from create_proposals).")],
+        replacement: Annotated[str, Field(max_length=1000000, description="The complete new proposed text; empty proposes deletion.")],
+        explanation: Annotated[str, Field(min_length=1, max_length=100000, description="Why the change is needed.")],
+        conversation_id: Annotated[str, Field(pattern=UUID_FIELD, description="This conversation's UUID, as for create_proposals.")],
+        request_id: Annotated[str, Field(pattern=UUID_FIELD, description="Fresh random UUID for this call, as for create_proposals.")],
+        figures: Annotated[list[ProposalFigure] | None, Field(default=None, max_length=20, description=FIGURES_FIELD + " On a revision a figure of the same name that this proposal added is replaced.")] = None,
+    ) -> CallToolResult:
+        """Change the proposed text and explanation of a pending proposal; its original text, ID, timestamp and
+        conversation stay as created. Never accepts or rejects it. figures adds or replaces this proposal's SVG drawings."""
+        payload = {"command": "revise-proposal", "source": source, "expected_source_sha256": expected_source_sha256,
+                   "proposal_id": proposal_id, "replacement": replacement, "explanation": explanation,
+                   "conversation_id": conversation_id, "request_id": request_id}
+        if figures:
+            payload["figures"] = [f.model_dump() for f in figures]
+        return await author(payload)
+
+    withdraw_tool = ToolAnnotations(readOnlyHint=False, destructiveHint=True, openWorldHint=False, idempotentHint=True)
+
+    @mcp.tool(name="remove_proposal", title="Withdraw a pending proposal", annotations=withdraw_tool)
+    async def remove_proposal(
+        source: Annotated[str, Field(min_length=1, description="Source path from read_source.")],
+        expected_source_sha256: Annotated[str, Field(pattern=r"^[0-9a-f]{64}$", description="source_sha256 from read_source; a changed source is refused (source_conflict).")],
+        proposal_id: Annotated[str, Field(pattern=r"^[a-z0-9][a-z0-9._:-]{0,127}$", description="ID of the pending proposal to withdraw (the first argument of its wrapper, or from create_proposals).")],
+        explanation: Annotated[str, Field(min_length=1, max_length=100000, description="Why the proposal is withdrawn.")],
+        conversation_id: Annotated[str, Field(pattern=UUID_FIELD, description="This conversation's UUID, as for create_proposals.")],
+        request_id: Annotated[str, Field(pattern=UUID_FIELD, description="Fresh random UUID for this call, as for create_proposals.")],
+    ) -> CallToolResult:
+        """Withdraw a pending agent proposal: its wrapper is removed and its captured original text restored, exactly
+        as Reject would leave the note. Use it to take back a proposal you made, for example one that breaks the build;
+        other proposals are kept. It is not a decision about the user's text: the user still accepts or rejects
+        proposals in Thoughts, and Thoughts records this one as withdrawn by the agent. Retry an uncertain call only
+        with identical arguments and the same request_id."""
+        return await author({"command": "remove-proposal", "source": source, "expected_source_sha256": expected_source_sha256,
+                             "proposal_id": proposal_id, "explanation": explanation,
+                             "conversation_id": conversation_id, "request_id": request_id})
+
+    @mcp.tool(name="create_document", title="Create a new note in a Project", annotations=proposal_tool)
+    @with_rules
+    async def create_document(
+        project: Annotated[str, Field(min_length=1, max_length=512, description="The Library Project: its exact name (the project list_documents shows) or its id.")],
+        name: Annotated[str, Field(min_length=1, max_length=200, description="Title of the new document as the Library shows it (no line breaks).")],
+        filename: Annotated[str, Field(min_length=4, max_length=900, description="Path of the new file inside the Project's default folder, ending in .md or .markdown (Markdown) or .tex (LaTeX), e.g. attention.md or notes/attention.md. Relative; no segment starting with '.', no '..'. A path that exists is refused.")],
+        content: Annotated[str, Field(min_length=1, max_length=4194304, description="The whole note, at most 4 MiB of UTF-8: Markdown (headings, lists, $math$), or a complete standalone LaTeX document (\\documentclass, \\begin{document} ... \\end{document}). Every sentence of prose on its own line.")],
+        conversation_id: Annotated[str, Field(pattern=UUID_FIELD, description="Lowercase UUID of this conversation, as for create_proposals: your Claude Code or Codex session ID if you have one; otherwise the one random UUID you use for every call of this conversation.")],
+        request_id: Annotated[str, Field(pattern=UUID_FIELD, description="Fresh random UUID for this call. Retry an uncertain call only with identical arguments and the same request_id; it then finishes the same note and never creates a second one.")],
+    ) -> CallToolResult:
+        """Create a NEW LaTeX or Markdown note in one of the user's Library Projects. Use it only when the user asks
+        for a new note. It only creates new documents and never overwrites: a filename that already exists is
+        refused (source_exists), and existing notes are changed only with create_proposals. Write every sentence of
+        prose on its own line. The note joins the Project under name, builds with the next render, and shows on the
+        phone and Mac after their next Sync; read it back with read_source like any note. Every note gets \\PdfLink
+        from the build (no \\providecommand needed). The content gets the checks of create_proposals (links, figure
+        paths, Markdown emoji and < in math)."""
+        return await create_note({"command": "create-document", "project": project, "name": name, "filename": filename,
+                                  "content": content, "conversation_id": conversation_id, "request_id": request_id})
+
+    async def create_note(payload: dict) -> CallToolResult:
+        try:
+            body = await asyncio.to_thread(proposal_client().run, payload)
+        except ThoughtsError as error:
+            return result(f"Not done: {error}. A retry with identical arguments and the same request_id never creates "
+                          "a second note.", {"accepted": False, "error_code": "not_allowed", "message": str(error)},
+                          error=True)
+        if not body.get("accepted"):
+            if body.get("retryable"):  # its message says to retry with the same request_id
+                return result(f"Not confirmed ({body.get('error_code')}), the note may or may not have been created: "
+                              f"{body.get('message')}", body, error=True)
+            return result(f"The note was not created ({body.get('error_code')}): {body.get('message')}", body, error=True)
+        # The new source and the Project's new document: read them fresh next time.
+        thoughts.cached.pop("sources", None)
+        thoughts.catalogue = None
+        builds = ("Thoughts builds its PDF now" if body.get("published", True)
+                  else "it is unpublished for now, because its PDF has no build inputs (see the warning)")
+        lines = [f"Created document \"{body['name']}\" in Project \"{body['project']}\" ({body['source']}, document id "
+                 f"{body['document_id']})" + (" (replayed: already created by this request_id)" if body.get("replayed") else "")
+                 + f"; {builds}, and the phone and Mac show it after their next Sync."]
+        lines += [f"Warning: {w['message']}" for w in body.get("warnings") or []]
+        core.log(f"document created: {body['source']} in {body['project']!r}")
+        return result("\n".join(lines), body)
+
+    @mcp.tool(name="build_status", title="Why a document's PDF does not build", annotations=readonly)
+    async def build_status(
+        document: Annotated[str, Field(min_length=1, max_length=1024, description="The document: its id, its name, its PDF filename or its source path (as list_documents or read_source show them).")],
+    ) -> CallToolResult:
+        """Why a document's PDF does not build, in one call: its render status, the error of its newest build with the
+        source file and line the server located, the LaTeX error lines of the build log, the links the build left
+        inactive, the files changed since the last PDF that built, and likely_causes: the pending proposals of the
+        failing sources ranked (the one holding the error line, the one holding what the error names, one that breaks
+        a rule such as a proposal inside \\hypersetup or a ../ figure path), each with its reasons and the fix
+        (revise_proposal, or remove_proposal and a proposal over the whole command). One broken note can stop every PDF
+        of its Project, so ask about the PDF that fails. Only reads."""
+        try:
+            doc = await find(document)
+            wanted = doc.get("document_id") or document
+        except LookupError:
+            wanted = document
+        try:
+            body = await asyncio.to_thread(proposal_client().run, {"command": "build-status", "document": wanted})
+        except ThoughtsError as error:
+            return result(f"Not available: {error}", {"accepted": False, "error_code": "not_allowed",
+                                                      "message": str(error)}, error=True)
+        if not body.get("accepted"):
+            return result(f"No build status ({body.get('error_code')}): {body.get('message')}", body, error=True)
+        lines = [body["message"]]
+        for error in body.get("errors") or []:
+            where = f"{error['source']}:{error['line']}: " if error.get("source") and error.get("line") else ""
+            lines.append(f"- error: {where}{error.get('detail') or error.get('message')}")
+        for shown in body.get("error_lines") or []:
+            lines.append(f"- line {shown['line']} of {shown['source']}: {shown['text']}")
+        for cause in body.get("likely_causes") or []:
+            lines.append(f"- proposal {cause['proposal_id']} (lines {cause['start_line']}-{cause['end_line']}, "
+                         f"{cause['created_at']}, score {cause['score']}): {'; '.join(cause['reasons'])}"
+                         + (f". Fix: {cause['fix']}" if cause.get("fix") else ""))
+        for warning in body.get("link_warnings") or []:
+            lines.append(f"- inactive link: {warning}")
+        return result("\n".join(lines), body)
+
+    move_tool = ToolAnnotations(readOnlyHint=False, destructiveHint=False, openWorldHint=False, idempotentHint=True)
+
+    @mcp.tool(name="move_pdf", title="Move an imported PDF to another Project", annotations=move_tool)
+    async def move_pdf(
+        pdf: Annotated[str, Field(min_length=1, max_length=1024, description="The imported PDF: its document id, its Library filename (with or without .pdf) or its name.")],
+        project: Annotated[str, Field(min_length=1, max_length=512, description="The destination Project: its exact name or its id.")],
+        request_id: Annotated[str, Field(pattern=UUID_FIELD, description="Fresh random UUID for this call. Retry an uncertain call only with identical arguments and the same request_id; it never moves twice.")],
+    ) -> CallToolResult:
+        """Move an imported PDF (a paper) to another Library Project, as Thoughts' Move to Project does: it lands in
+        that Project's default folder and its review cards move with it; moving it back undoes it. Only when the user
+        asks to move a PDF. Links to it need no edit: \\PdfLink and \\CrossPdfLink find a Library PDF by its filename
+        wherever it is; the answer lists the notes that name it. The phone and Mac see the move after their next
+        Sync."""
+        try:
+            body = await asyncio.to_thread(proposal_client().run, {"command": "move-pdf", "pdf": pdf,
+                                                                   "project": project, "request_id": request_id})
+        except ThoughtsError as error:
+            return result(f"Nothing moved: {error}", {"accepted": False, "error_code": "not_allowed",
+                                                      "message": str(error)}, error=True)
+        if not body.get("accepted"):
+            state = "it may or may not have moved" if body.get("retryable") else "nothing moved"
+            return result(f"Not moved ({body.get('error_code')}; {state}): {body.get('message')}", body, error=True)
+        thoughts.catalogue = None
+        thoughts.cached.pop("sources", None)
+        lines = [body["message"] + (" (replayed: already moved by this request_id)" if body.get("replayed") else "")]
+        if body.get("linking_sources"):
+            lines.append("Notes that name it: " + ", ".join(body["linking_sources"]))
+        core.log(f"pdf moved: {body.get('filename')} {body.get('from_project')!r} -> {body.get('to_project')!r}")
+        return result("\n".join(lines), body)
+
+    import_tool = ToolAnnotations(readOnlyHint=False, destructiveHint=False, openWorldHint=True, idempotentHint=True)
+
+    @mcp.tool(name="import_pdf", title="Import PDF into a Thoughts project", annotations=import_tool)
+    async def import_pdf(
+        project: Annotated[str, Field(min_length=1, max_length=2000, description="Project name (case-insensitive) or id; list_documents shows each document's project.")],
+        name: Annotated[str, Field(min_length=1, max_length=150, description="Document name shown in the Library, e.g. the paper title.")],
+        url: Annotated[str, Field(min_length=1, max_length=4096, description="An https URL that returns the PDF (for arXiv the /pdf/ link, not /abs/); it is kept as the document's source link.")],
+    ) -> CallToolResult:
+        """Import a PDF (a paper) into a Library project from a URL, exactly as Import document in the Library does.
+
+        The Thoughts server downloads it itself (https on a public host, at most 100 MiB) and adds it to the
+        project; the Mac and the phone get it with their next Sync. Use it when the user asks to add a paper or PDF
+        to Thoughts, instead of giving them a file to import by hand. Importing a PDF the project already has
+        changes nothing and reports replayed: true, so a retry is safe. The result names the document (document_id,
+        filename) for links (\\PdfLink{<filename without .pdf>}{document-start}{text}) and review cards."""
+        def refused(code: str, message: str, state: str = "nothing imported") -> CallToolResult:
+            return result(f"Not imported ({code}; {state}): {message}",
+                          {"accepted": False, "error_code": code, "message": message}, error=True)
+
+        try:
+            capabilities = (await thoughts.ttl("health", "/v1/health")).get("capabilities") or []
+        except ThoughtsError as error:
+            return refused("not_available", str(error))
+        if IMPORT_CAPABILITY not in capabilities:
+            return refused("not_supported", "this Thoughts server cannot import from a URL yet (it lacks "
+                           f"{IMPORT_CAPABILITY}); ask the user to import the PDF in Thoughts' Library.")
+        try:
+            response = await thoughts.request("POST", "/v1/library/url-imports", timeout=IMPORT_SECONDS, refusals=True,
+                                              body={"project": project, "name": name, "url": url})
+        except ThoughtsError as error:
+            return refused("not_allowed", str(error))
+        except Exception as error:  # noqa: BLE001  (a timeout or a dropped connection: the import may have happened)
+            return refused("unknown", f"{type(error).__name__}: {error}. Call import_pdf again with the same "
+                           "arguments: a PDF the project already has is reported as replayed.",
+                           "it may or may not have been imported")
+        body = response.json()
+        if response.status_code >= 400 or not body.get("accepted"):
+            code = body.get("error_code") or "refused"
+            return result(f"Not imported ({code}; nothing imported): {body.get('detail') or body.get('message')}",
+                          {**body, "accepted": False, "error_code": code}, error=True)
+        thoughts.catalogue = None
+        thoughts.cached.pop("sources", None)
+        key = body["filename"].removesuffix(".pdf")
+        if body.get("replayed"):
+            text = (f"{body['project']} already has this PDF: {body.get('name')} ({body['filename']}, document_id "
+                    f"{body['document_id']}); nothing changed (replayed).")
+        else:
+            text = (f"Imported {body.get('name')} into {body['project']} as {body['filename']} (document_id "
+                    f"{body['document_id']}, {body.get('page_count')} page(s)). The Mac and the phone get it with their "
+                    "next Sync.")
+        text += f" Link it with \\PdfLink{{{key}}}{{document-start}}{{{body.get('name')}}}."
+        core.log(f"pdf imported: {body['filename']} into {body['project']!r} from {url[:200]}"
+                 + (" (replayed)" if body.get("replayed") else ""))
+        return result(text, body)
+
+    async def page_folder(value: str) -> str:
+        """A docs-* folder from a folder name, a path inside it, or a document id or name (its source's folder)."""
+        head = value.strip().strip("/").split("/", 1)[0]
+        if FOLDER.fullmatch(head):
+            return head
+        doc = await find(value)
+        head = (doc.get("source_file") or "").split("/", 1)[0]
+        if not FOLDER.fullmatch(head):
+            raise LookupError(f"{doc['name']} is not in a docs-* folder, and only docs-* folders have HTML pages")
+        return head
+
+    @mcp.tool(name="html_pages", title="A folder's interactive HTML pages", annotations=readonly)
+    async def html_pages(
+        folder: Annotated[str, Field(min_length=1, max_length=900, description="The docs-* source folder (e.g. docs-concepts-a6fe5d), a path in it, or a document id or name.")],
+        path: Annotated[str, Field(default="", max_length=900, description="Optional: one page's path; its HTML is returned too.")] = "",
+    ) -> CallToolResult:
+        """The interactive HTML pages of a docs folder (self-contained .html files at <folder>/tex/support/html/,
+        opened from a note's thoughts-html: link in a sandboxed viewer with no network access), each with the link a
+        note of that folder uses. With path, also that page's HTML (to read it before replacing it with
+        add_html_page). A page not yet in the folder's list exists because the Mac's build inputs carry it."""
+        name = await page_folder(folder)
+        listing = (await thoughts.request("GET", "/v1/html-pages", params={"folder": name})).json()
+        rows = [{**page, "listed": listed, "link": "thoughts-html:" + page["path"]}
+                for listed, key in ((True, "pages"), (False, "unlisted_pages")) for page in listing.get(key, [])]
+        rows.sort(key=lambda page: page["path"])
+        structured = {"folder": name, "pages": rows}
+        lines = [f"{len(rows)} HTML page(s) in {name}:"] + [
+            f"- {page['path']} ({page['size_bytes']} bytes{'' if page['listed'] else ', from the Mac build inputs'}): "
+            f"link thoughts-html:{page['path']}" for page in rows]
+        if path:
+            page = next((row for row in rows if row["path"] == path), None)
+            if page is None:
+                raise LookupError(f"{name} has no HTML page {path!r}")
+            html = (await thoughts.object(page["sha256"])).decode("utf-8", "replace")
+            if len(html) > 2_000_000:
+                lines.append(f"{path} is {len(html)} characters, too long to show here.")
+            else:
+                structured["html"] = html
+                lines += [f"--- {path} ---", html]
+        return result("\n".join(lines), structured)
+
+    page_tool = ToolAnnotations(readOnlyHint=False, destructiveHint=False, openWorldHint=False, idempotentHint=True)
+
+    @mcp.tool(name="add_html_page", title="Add an interactive HTML page to a folder", annotations=page_tool)
+    async def add_html_page(
+        folder: Annotated[str, Field(min_length=1, max_length=900, description="The docs-* folder of the note that will link the page (e.g. docs-concepts-a6fe5d), a path in it such as the note's source path, or the note's document id or name.")],
+        name: Annotated[str, Field(pattern=r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,122}$", description="File name of the page, letters, digits, '.', '_' and '-' (.html is added if missing), e.g. irt-middle-slope.")],
+        html: Annotated[str, Field(min_length=1, max_length=20971520, description="The complete self-contained page (at most 20 MiB of UTF-8): scripts, styles, fonts, images and data embedded inline. The viewer allows no network access, forms, frames or storage.")],
+        request_id: Annotated[str, Field(pattern=UUID_FIELD, description="Fresh random UUID for this call. Retry an uncertain call only with identical arguments.")],
+        replace: Annotated[bool, Field(default=False, description="Replace a page of that name. Read it first with html_pages; without replace an existing page is refused (html_page_exists).")] = False,
+    ) -> CallToolResult:
+        """Add (or, with replace, replace) one interactive HTML page in a docs folder, as
+        <folder>/tex/support/html/<name>.html. Use it when the user wants an interactive figure, explorer or small
+        simulation next to a note. It does not change any note: then call create_proposals on a note of the same folder
+        and put the link in the replacement, LaTeX \\href{thoughts-html:<path>}{text}, Markdown
+        [text](thoughts-html:<path>), for example next to the figure it explains. The Mac installs the page into the
+        folder with its next Sync, and every PDF of the folder carries it once rebuilt; the user opens it from the link.
+        A page another device changed meanwhile is never overwritten (html_page_changed: read it again)."""
+        try:
+            target = await page_folder(folder)
+            body = await asyncio.to_thread(proposal_client().run, {
+                "command": "add-html-page", "folder": target, "name": name, "html": html, "replace": replace,
+                "request_id": request_id})
+        except (ThoughtsError, LookupError) as error:
+            return result(f"Nothing was saved: {error}", {"accepted": False, "error_code": "not_allowed",
+                                                           "message": str(error)}, error=True)
+        if not body.get("accepted"):
+            return result(f"Nothing was saved ({body.get('error_code')}): {body.get('message')}", body, error=True)
+        lines = [f"{'Replaced' if body.get('replaced') else 'Saved'} HTML page {body['path']} ({body['size_bytes']} bytes)"
+                 + ("" if body.get("changed") else " (it already had this content)")
+                 + f". Link it from a note of {body['folder']} with create_proposals: LaTeX {body['latex']}, Markdown "
+                 f"{body['markdown']}. The Mac and phone receive it with their next Sync; a note's PDF carries it once rebuilt."]
+        lines += [f"Warning: {w['message']}" for w in body.get("warnings") or []]
+        core.log(f"html page: {'replaced' if body.get('replaced') else 'saved'} {body['path']}")
+        return result("\n".join(lines), body)
+
+    card_tool = ToolAnnotations(readOnlyHint=False, destructiveHint=False, openWorldHint=False, idempotentHint=True)
+    LineBoundary = Annotated[int, Field(strict=True, ge=1, le=2147483647)]
+
+    @mcp.tool(name="create_review_card", title="Create a review card from a note's passage", annotations=card_tool)
+    async def create_review_card(
+        source: Annotated[str, Field(min_length=1, description="Source path from read_source: the main .tex or .md source of a Library document.")],
+        expected_source_sha256: Annotated[str, Field(pattern=r"^[0-9a-f]{64}$", description="source_sha256 from read_source; a changed source is refused (source_conflict).")],
+        start_line: Annotated[LineBoundary, Field(description="One-based first complete source line of the answer.")],
+        end_line: Annotated[LineBoundary, Field(description="Exclusive end line of the continuous answer range.")],
+        question: Annotated[str, Field(min_length=1, max_length=500, description="The card's question; the selected passage is its answer.")],
+        due_at: Annotated[str, Field(description="First review time as ISO 8601 with a timezone, for example 2026-11-05T09:00:00+01:00; now or later.")],
+        request_id: Annotated[str, Field(pattern=UUID_FIELD, description="Fresh random UUID for this call; it becomes the card's ID. Retry an uncertain call only with identical arguments and the same request_id; it never makes a second card.")],
+    ) -> CallToolResult:
+        """Create a review card whose answer is a passage of one of the user's notes, as the Mac's Create card does.
+        Use it only when the user asks for a card. Read the note with read_source first and select complete lines:
+        whole paragraphs or blocks with text, in LaTeX inside the document body and outside figures, tables, math and
+        unclosed groups, in Markdown whole top-level blocks (a list entirely); not inside a pending proposal or another
+        card's passage. Thoughts marks the passage in the source with the card's markers (they do not change the PDF)
+        and saves the approved card in the same step; the card's PDF areas are placed when the note is next built, and
+        the phone and Mac show it after their next Sync. The card is due at due_at."""
+        return await card_command({"command": "create-review-card", "source": source,
+                                   "expected_source_sha256": expected_source_sha256, "start_line": start_line,
+                                   "end_line": end_line, "question": question, "due_at": due_at,
+                                   "request_id": request_id})
+
+    @mcp.tool(name="move_review_card", title="Move a review card into a note", annotations=card_tool)
+    async def move_review_card(
+        card_id: Annotated[str, Field(pattern=UUID_FIELD, description="Card to move (card_id from review_cards or get_review_card).")],
+        source: Annotated[str, Field(min_length=1, description="Source path from read_source: the main .tex or .md source of the note to move it into.")],
+        expected_source_sha256: Annotated[str, Field(pattern=r"^[0-9a-f]{64}$", description="source_sha256 from read_source; a changed source is refused (source_conflict).")],
+        start_line: Annotated[LineBoundary, Field(description="One-based first complete source line of the card's new answer.")],
+        end_line: Annotated[LineBoundary, Field(description="Exclusive end line of the continuous answer range.")],
+        request_id: Annotated[str, Field(pattern=UUID_FIELD, description="Fresh random UUID for this call. Retry an uncertain call only with identical arguments and the same request_id.")],
+    ) -> CallToolResult:
+        """Move a review card that has no source markers yet (for example a card on an imported paper's PDF) into a
+        note, as the Mac's move-review-card does: the card keeps its ID, question, review history and schedule, and its
+        answer becomes the selected source lines, marked like create_review_card (same selection rules). Use it only when
+        the user asks to move a card. A card already linked to source markers is refused (linked_card): the user moves
+        it in Thoughts by cutting its marked passage and pasting it into the other note.
+
+        The new home may be text that is still a pending agent proposal: select the lines of its proposed text (in
+        read_source, the last argument of \\agentProposedEdit, or the text between a Markdown proposal's header and
+        its end comment; the wrapper's own "}{" or closing "}" on those lines is fine, its explanation and original text
+        are not). Then nothing changes yet: the result is state waiting_for_proposal with the proposal_id and a
+        pending_move_id, and Thoughts moves the card by itself when the user accepts that proposal, exactly as it would
+        move it onto the accepted text. Do not ask the user to accept first or to call again. If the user rejects the
+        proposal or it is withdrawn, or revised so that those lines are gone, or the card is deleted or moved another
+        way first, the move is dropped and the card stays where it was. pending_card_moves shows such moves (also in
+        get_review_card) and cancel_pending_card_move cancels one. An older Thoughts server refuses lines inside a
+        pending proposal (invalid_selection)."""
+        return await card_command({"command": "move-review-card", "card_id": card_id, "source": source,
+                                   "expected_source_sha256": expected_source_sha256, "start_line": start_line,
+                                   "end_line": end_line, "request_id": request_id})
+
+    merge_tool = ToolAnnotations(readOnlyHint=False, destructiveHint=True, openWorldHint=False, idempotentHint=True)
+    CardId = Annotated[str, Field(pattern=UUID_FIELD)]
+
+    @mcp.tool(name="merge_review_cards", title="Merge review cards into one", annotations=merge_tool)
+    async def merge_review_cards(
+        card_ids: Annotated[list[CardId], Field(min_length=2, max_length=20, description="The cards to merge (card_id from review_cards or get_review_card): two or more cards of one document whose passages are marked in `source`.")],
+        source: Annotated[str, Field(min_length=1, description="Source path from read_source: the file that holds every card's markers.")],
+        expected_source_sha256: Annotated[str, Field(pattern=r"^[0-9a-f]{64}$", description="source_sha256 from read_source; a changed source is refused (source_conflict).")],
+        request_id: Annotated[str, Field(pattern=UUID_FIELD, description="Fresh random UUID for this call. Retry an uncertain call only with identical arguments and the same request_id; it never merges twice.")],
+        keep_card_id: Annotated[CardId | None, Field(description="The card that stays, with its ID, schedule and review history; one of card_ids. Default: the one with the most reviews.")] = None,
+        question: Annotated[str | None, Field(min_length=1, max_length=500, description="The merged card's question. Default: the cards' questions joined in reading order.")] = None,
+    ) -> CallToolResult:
+        """Merge two or more review cards into one, as Merge cards… in the Thoughts app does.
+
+        The kept card keeps its ID, schedule and review history, takes `question`, and gets every card's marked
+        passage as its own answer area, in reading order; text between the passages (figures, other paragraphs)
+        stays out of the card. The other cards are deleted with their markers and history. It is one change, made at
+        once by the Thoughts server: no proposals and nothing for the user to accept piece by piece; never merge cards
+        with a deletion and an edit, or with proposals that move markers. Use it only when the user asked for these
+        cards to be merged. Read the source with read_source first. The phone and Mac get the merge with their next
+        Sync; the kept card's PDF areas are placed when the note is next built.
+        Returns kept_card_id, deleted_card_ids, card_order (reading order), question, passages and the source's new
+        source_sha256. Errors: merge_refused with the reason (cards of several documents or source files, a PDF-only
+        card, cards on different PDF versions, a card without answer areas yet), card_unavailable, source_conflict
+        (read the source again), invalid_source, request_conflict, not_supported (an older Thoughts server)."""
+        def refused(code: str, message: str) -> CallToolResult:
+            return result(f"Not merged ({code}; nothing changed): {message}",
+                          {"accepted": False, "error_code": code, "message": message}, error=True)
+
+        try:
+            capabilities = (await thoughts.ttl("health", "/v1/health")).get("capabilities") or []
+        except ThoughtsError as error:
+            return refused("not_available", str(error))
+        if MERGE_CAPABILITY not in capabilities:
+            return refused("not_supported", f"this Thoughts server cannot merge review cards yet (it lacks "
+                           f"{MERGE_CAPABILITY}); the user can merge them with Merge cards… in Thoughts on the Mac.")
+        try:
+            commands = load_thoughts_cli().client.COMMANDS
+        except ThoughtsError as error:
+            return refused("not_available", str(error))
+        if "merge-review-cards" not in commands:
+            return refused("not_supported", "the thoughts-cli installed next to the connector cannot merge review cards "
+                           "yet (it needs merge-review-cards); the user can merge them with Merge cards… in Thoughts on the Mac.")
+        payload = {"command": "merge-review-cards", "card_ids": card_ids, "source": source,
+                   "expected_source_sha256": expected_source_sha256, "request_id": request_id}
+        if keep_card_id is not None:
+            payload["keep_card_id"] = keep_card_id
+        if question is not None:
+            payload["question"] = question
+        try:
+            body = await asyncio.to_thread(proposal_client().run, payload)
+        except ThoughtsError as error:
+            return refused("not_allowed", str(error))
+        if not body.get("accepted"):
+            hint = (f" The current source_sha256 is {body['current_source_sha256']}; read the source again."
+                    if body.get("current_source_sha256") else "")
+            if body.get("retryable"):  # its message says to retry with the same request_id
+                return result(f"Not confirmed ({body.get('error_code')}), the cards may or may not have been merged: "
+                              f"{body.get('message')}", body, error=True)
+            return result(f"Not merged ({body.get('error_code')}; nothing changed): {body.get('message')}{hint}",
+                          body, error=True)
+        # The merged source and cards: read them fresh next time.
+        thoughts.cached.pop("sources", None)
+        thoughts.cached.pop("projections", None)
+        lines = [f"Merged {len(body['card_order'])} cards of {body['document']} into card {body['kept_card_id']}"
+                 + (" (replayed: already merged by this request_id)" if body.get("replayed") else "")
+                 + f": question \u201c{body['question']}\u201d, {body['passages']} passage(s) marked in {body['source']} "
+                 f"(new source_sha256 {body['source_sha256']}). Deleted with their markers: "
+                 f"{', '.join(body['deleted_card_ids'])}. The kept card keeps its schedule and review history; its PDF "
+                 "areas are placed when the note is next built, and the phone and Mac show the merge after their next Sync."]
+        if (body.get("render_check") or {}).get("status") == "failed":
+            lines.append(f"Warning: the rebuild could not be requested: {body['render_check'].get('message')}")
+        core.log(f"review cards merged into {body['kept_card_id']} in {body['source']}: {len(body['card_order'])} cards"
+                 + (" (replayed)" if body.get("replayed") else ""))
+        return result("\n".join(lines), body)
+
+    async def card_command(payload: dict) -> CallToolResult:
+        try:
+            body = await asyncio.to_thread(proposal_client().run, payload)
+        except ThoughtsError as error:
+            return result(f"Nothing was written: {error}", {"accepted": False, "error_code": "not_allowed",
+                                                             "message": str(error)}, error=True)
+        if not body.get("accepted"):
+            hint = (f" The current source_sha256 is {body['current_source_sha256']}; read the source again."
+                    if body.get("current_source_sha256") else "")
+            if body.get("retryable"):  # its message says to retry with the same request_id
+                return result(f"Not confirmed ({body.get('error_code')}), the card may or may not have been written: "
+                              f"{body.get('message')}", body, error=True)
+            return result(f"Nothing was written ({body.get('error_code')}): {body.get('message')}{hint}", body, error=True)
+        if body.get("state") == "waiting_for_proposal":
+            core.log(f"review card: {body['card_id']} waits for proposal {body['proposal_id']} in {body['source']}"
+                     + (" (replayed)" if body.get("replayed") else ""))
+            return result(waiting_text(body), body)
+        # The marked source and the new or moved card: read them fresh next time.
+        thoughts.cached.pop("sources", None)
+        thoughts.cached.pop("projections", None)
+        moved = body["state"] == "card_moved"
+        lines = [(f"Moved card {body['card_id']} from {body['from_document']} into {body['document']}" if moved
+                  else f"Created card {body['card_id']} in {body['document']}, due {body['due_at']}")
+                 + (" (replayed: already written by this request_id)" if body.get("replayed") else "")
+                 + f"; its passage is marked in {body['source']} (new source_sha256 {body['source_sha256']}). "
+                 + "Its PDF areas are placed when the note is next built; the phone and Mac show it after their next Sync."]
+        if (body.get("render_check") or {}).get("status") == "failed":
+            lines.append(f"Warning: the rebuild could not be requested: {body['render_check'].get('message')}")
+        core.log(f"review card: {body['state']} {body['card_id']} in {body['source']}")
+        return result("\n".join(lines), body)
+
+    async def pending_moves_supported() -> str | None:
+        """Why pending card moves cannot be used here, or None."""
+        try:
+            capabilities = (await thoughts.ttl("health", "/v1/health")).get("capabilities") or []
+        except ThoughtsError as error:
+            return str(error)
+        if PENDING_MOVES_CAPABILITY not in capabilities:
+            return f"this Thoughts server cannot keep card moves that wait for a proposal yet ({PENDING_MOVES_CAPABILITY})"
+        try:
+            commands = load_thoughts_cli().client.COMMANDS
+        except ThoughtsError as error:
+            return str(error)
+        if "pending-card-moves" not in commands:
+            return "the thoughts-cli installed next to the connector cannot list pending card moves yet"
+        return None
+
+    @mcp.tool(name="pending_card_moves", title="Card moves waiting for a proposal", annotations=readonly)
+    async def pending_card_moves(
+        card_id: Annotated[str | None, Field(pattern=UUID_FIELD, description="Only this card's moves.")] = None,
+        state: Annotated[Literal["waiting_for_proposal", "moved", "dropped", "cancelled", "all"], Field(
+            description="waiting_for_proposal (default): moves still waiting; or those made, dropped, cancelled, or all.")]
+            = "waiting_for_proposal",
+    ) -> CallToolResult:
+        """Review card moves that wait for the user to accept a pending agent proposal (move_review_card onto a
+        proposal's text), newest first: card, proposal, the note and the target lines' text, and once settled why
+        (moved; dropped because the proposal was rejected, withdrawn or revised, or the card was deleted, moved or
+        linked another way first; cancelled). Reads only."""
+        if (problem := await pending_moves_supported()) is not None:
+            return result(f"Not available (not_supported): {problem}.", {"accepted": False, "error_code": "not_supported",
+                                                                          "message": problem}, error=True)
+        payload = {"command": "pending-card-moves", "state": state}
+        if card_id:
+            payload["card_id"] = card_id
+        try:
+            body = await asyncio.to_thread(proposal_client().run, payload)
+        except ThoughtsError as error:
+            return result(f"Not available: {error}", {"accepted": False, "error_code": "not_allowed",
+                                                       "message": str(error)}, error=True)
+        if not body.get("accepted"):
+            return result(f"Not available ({body.get('error_code')}): {body.get('message')}", body, error=True)
+        moves = body.get("pending_moves") or []
+        lines = [f"{len(moves)} pending card move(s)" + (f" ({state})" if state != "waiting_for_proposal" else "") + ":"]
+        lines += [pending_move_line(move) for move in moves]
+        return result("\n".join(lines), body)
+
+    cancel_tool = ToolAnnotations(readOnlyHint=False, destructiveHint=False, openWorldHint=False, idempotentHint=True)
+
+    @mcp.tool(name="cancel_pending_card_move", title="Cancel a card move waiting for a proposal", annotations=cancel_tool)
+    async def cancel_pending_card_move(
+        pending_move_id: Annotated[str, Field(pattern=UUID_FIELD, description="pending_move_id from move_review_card or pending_card_moves.")],
+    ) -> CallToolResult:
+        """Cancel a review card move that waits for a pending proposal; the card stays where it is and the proposal
+        is not touched. A move already made cannot be cancelled (already_moved): move the card again instead."""
+        if (problem := await pending_moves_supported()) is not None:
+            return result(f"Nothing was cancelled (not_supported): {problem}.",
+                          {"accepted": False, "error_code": "not_supported", "message": problem}, error=True)
+        try:
+            body = await asyncio.to_thread(proposal_client().run, {"command": "cancel-pending-card-move",
+                                                                   "pending_move_id": pending_move_id})
+        except ThoughtsError as error:
+            return result(f"Nothing was cancelled: {error}", {"accepted": False, "error_code": "not_allowed",
+                                                               "message": str(error)}, error=True)
+        if not body.get("accepted"):
+            return result(f"Nothing was cancelled ({body.get('error_code')}): {body.get('message')}", body, error=True)
+        core.log(f"pending card move {pending_move_id}: cancelled" + (" (already settled)" if body.get("already_settled")
+                                                                       else ""))
+        text = (f"The move was already {body['state']}; nothing changed." if body.get("already_settled") else
+                f"Cancelled: card {body['card_id']} stays on {body['from_document']}; proposal {body['proposal_id']} is "
+                "untouched.")
+        return result(text, body)
+
+    asgi = core.app(ctx)
+    asgi.thoughts, asgi.provider = thoughts, ctx.provider
+    return asgi
+
+
+if __name__ == "__main__":
+    core.main(SERVICE, create_app, sys.argv)

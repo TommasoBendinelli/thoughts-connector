@@ -1,0 +1,6 @@
+# gitleaks configuration: the default rules (no known false positives).
+# Run: gitleaks git --config .gitleaks.toml .
+title = "Thoughts connector"
+
+[extend]
+useDefault = true

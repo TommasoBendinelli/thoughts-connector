@@ -1,0 +1,77 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-2.0-or-later
+"""Prints one line per new reply the phone sends to an agent note (long-polls the Thoughts server).
+
+The server-side version of the Mac's tools/mcp/thoughts-watch-replies: watches replies to the notes the
+Thoughts connector sends (device `connector`, token in ~/connectors/thoughts-token, server on
+THOUGHTS_SERVER_URL, default http://127.0.0.1:8080), which is how an agent here sends notes. Run it as a
+background monitor; read each reply with the connector's get_note tool. Starts after the newest existing
+reply. Installed as ~/.local/bin/thoughts-watch-replies; needs ~/connectors/agent_notes.py from the same
+desktop version (Client.replies with listen).
+
+It tells the server that an agent listens (protocol "Who hears a reply"), so while it runs the phone shows
+the user that their reply will be heard; once it stops, the phone warns that nobody is listening.
+Connector notes name no conversation, so it listens for every note the connector sent.
+"""
+import os
+import sys
+import time
+from pathlib import Path
+
+os.environ.setdefault("THOUGHTS_SERVER_URL", "http://127.0.0.1:8080")
+if "THOUGHTS_TOKEN" not in os.environ:
+    os.environ["THOUGHTS_TOKEN"] = (Path.home() / "connectors" / "thoughts-token").read_text().strip()
+# The connector's agent_notes.py (THOUGHTS_AGENT_NOTES names the file, as for the connector).
+sys.path.insert(0, str(Path(os.environ["THOUGHTS_AGENT_NOTES"]).parent if os.environ.get("THOUGHTS_AGENT_NOTES")
+                       else Path.home() / "connectors"))
+import agent_notes as a  # noqa: E402
+
+
+def newest_cursor(client) -> int:
+    """The feed answers oldest first, 50 at a time: page to the newest reply."""
+    if hasattr(a, "feed_cursor"):
+        return a.feed_cursor(client)
+    cursor = 0
+    while True:
+        page = client.replies(after=cursor, wait=0)
+        sequences = [reply.get("sequence", 0) for reply in page.get("replies", [])]
+        if not sequences:
+            return cursor
+        cursor = max(sequences)
+
+
+def line(reply) -> str:
+    note = reply.get("note") or {}
+    photo = reply.get("photo") or {}
+    with_photo = f" photo={photo.get('capture') or 'yes'}" if photo else ""
+    return (f"REPLY note={reply.get('note_id')} title={note.get('title')!r} "
+            f"strokes={reply.get('stroke_count')}{with_photo} message={reply.get('message')!r}")
+
+
+def main() -> None:
+    client = a.default_client()
+    if "--check" in sys.argv:
+        print("ok cursor", newest_cursor(client), flush=True)
+        return
+    after = None
+    while after is None:
+        try:
+            after = newest_cursor(client)
+        except Exception as error:
+            print(f"ERROR {type(error).__name__}: {error}", flush=True)
+            time.sleep(15)
+    print("LISTENING for replies to every note the connector sent", flush=True)
+    while True:
+        try:
+            result = client.replies(after=after, wait=50, listen=True)
+            for reply in result.get("replies", []):
+                after = max(after, reply.get("sequence", 0))
+                print(line(reply), flush=True)
+            after = max(after, result.get("cursor") or after)
+        except Exception as error:
+            print(f"ERROR {type(error).__name__}: {error}", flush=True)
+            time.sleep(15)
+
+
+if __name__ == "__main__":
+    main()

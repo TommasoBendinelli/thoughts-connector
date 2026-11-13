@@ -1,0 +1,28 @@
+{
+  "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
+  "name": "thoughts",
+  "version": "0.1.0",
+  "description": "A Thoughts Library: documents, review cards and notes to the phone.",
+  "author": {
+    "name": "Tommaso Bendinelli"
+  },
+  "extensions": {
+    "com.openai": {
+      "interface": {
+        "displayName": "Thoughts",
+        "shortDescription": "Your Library and review cards",
+        "longDescription": "Read and search your Thoughts Library (LaTeX, Markdown and PDF documents), see your review cards with their answers and how you rated yourself, send a note with math to your phone to draw on and read your reply, propose edits to your notes, create, move and merge review cards, and import a PDF from its URL.",
+        "developerName": "Tommaso Bendinelli",
+        "category": "Productivity",
+        "capabilities": [
+          "Interactive"
+        ],
+        "defaultPrompt": [
+          "Which review cards did I struggle with this week?",
+          "Explain the Results section of my latest paper.",
+          "Send me a sketch of this derivation to annotate."
+        ]
+      }
+    }
+  }
+}

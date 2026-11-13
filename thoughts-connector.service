@@ -1,0 +1,23 @@
+[Unit]
+Description=Thoughts connector: the Thoughts Library in ChatGPT/Claude, notes to the phone (port 8095)
+After=network-online.target
+
+[Service]
+# Install as a systemd --user unit; the code, venv and state live in ~/connectors.
+ExecStart=%h/connectors/venv/bin/python %h/connectors/thoughts_connector.py serve
+Environment=THOUGHTS_CONNECTOR_STATE=%h/connectors/state/thoughts
+Environment=THOUGHTS_CONNECTOR_TOKEN=%h/connectors/thoughts-token
+Environment=THOUGHTS_CONNECTOR_PORT=8095
+Environment=THOUGHTS_URL=http://127.0.0.1:8080
+Environment=THOUGHTS_AGENT_NOTES=%h/connectors/agent_notes.py
+Environment=THOUGHTS_CHROME=/usr/bin/chromium-browser
+Environment=CONNECTOR_PASSPHRASE=%h/connectors/passphrase.json
+# The public origin of your reverse proxy:
+Environment=CONNECTOR_PUBLIC_URL=https://thoughts.example.org
+Environment=PYTHONUNBUFFERED=1
+NoNewPrivileges=yes
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target
