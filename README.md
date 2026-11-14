@@ -12,29 +12,43 @@ By **Tommaso Bendinelli**.
 
 ## What it can do
 
-Tools: `list_documents`, `read_document` (LaTeX with `\input` files inlined, Markdown, or PDF text),
-`search_library`, `document_feedback`, `review_cards` / `get_review_card`, `knowledge_profile`
-(which cards on a topic are solid, shaky, unknown or unreviewed), `link_conversation`, `list_notes`,
-`get_note` (with the user's replies, their drawings and the photo sent with a reply), `send_note`
-(Markdown with math rendered to a phone-width PNG), `add_diary_entry`, `read_source`,
+Tools: `list_documents` (with each PDF's Library filename), `read_document` (LaTeX with `\input`
+files inlined, Markdown, or PDF text), `search_library`, `document_feedback`, `review_cards` /
+`get_review_card`, `knowledge_profile` (which cards on a topic are solid, shaky, unknown or
+unreviewed), `link_conversation`, `list_notes`, `get_note` (with the user's replies, their drawings
+and the photo sent with a reply), `send_note` (Markdown with math rendered to a phone-width PNG; its
+links become tappable areas of the picture that open a web page or a page of a Library PDF),
+`note_rules`, `own_topic` / `release_topic`, `add_diary_entry`, `read_source`,
 `create_proposals` / `revise_proposal` / `remove_proposal`, `source_conflicts` /
 `read_source_conflict` / `resolve_source_conflict`, `create_document`, `create_review_card` /
-`move_review_card`, `merge_review_cards` (cards of one document merged into one, when the user asks),
-`pending_card_moves` / `cancel_pending_card_move` (a card moved onto the text of a pending proposal
-waits until the user accepts that proposal), `html_pages` / `add_html_page`, `build_status`,
-`move_pdf`, `import_pdf` (the server downloads a PDF from a URL into a Project).
+`move_review_card` (a card linked to source markers moves with its marked passage as two linked
+pending proposals that the user accepts or rejects as one), `merge_review_cards` (cards of one
+document merged into one, when the user asks), `pending_card_moves` / `cancel_pending_card_move` (a
+card moved onto the text of a pending proposal waits until the user accepts that proposal),
+`html_pages` / `add_html_page`, `build_status`, `move_pdf`, `import_pdf` (the server downloads a PDF
+from a URL into a Project).
 
 Reply listening: while `get_note` waits for a reply (`wait_for_reply_s`), or while
 `thoughts-watch-replies` runs, the server knows that an agent listens, and the phone shows the user
 whether their reply will be heard; `send_note` says when nobody listens.
 
+Who answers a reply (thoughts-server `protocol/agent-notes.md`, "Who answers"): an agent passes its
+conversation id to `send_note` and `get_note`; `get_note` then claims each reply (or the page the user
+sent) that the conversation covers, so only one agent answers it, and hands over the user's answering
+rules (the Library note `agent-note-rules.md`, also read by `note_rules`). `own_topic` makes a
+conversation responsible for the notes and pages of a topic (a Project, documents, review cards or
+title tags) while it keeps `thoughts-watch-replies --conversation <id>` running; `release_topic` ends
+it. What no running agent covers is left to a responder agent, if the server's owner runs one
+("One responder"); it is not part of this repository. The tool texts name the watcher as
+`~/.local/bin/thoughts-watch-replies`, so install it there.
+
 The connector talks to the Thoughts server as its own device (`connector`), and every request goes
 through an allowlist in `thoughts_connector.py` (`check_request`): it reads the Library, creates
-agent notes, diary entries and conversation links, and publishes sources into which thoughts-cli
-wrote *pending* proposals, and asks the server for a PDF import by URL, a merge of review cards or a
-pending card move. It never accepts or rejects a proposal and never reviews or retires a card; cards
-are deleted only by the server, as part of a merge the user asked for. It refuses every other
-Library-project action.
+agent notes, diary entries and conversation links, claims replies, registers and ends topic owners,
+reads the answering rules, publishes sources into which thoughts-cli wrote *pending* proposals, and
+asks the server for a PDF import by URL, a merge of review cards or a pending card move. It never
+accepts or rejects a proposal and never reviews or retires a card; cards are deleted only by the
+server, as part of a merge the user asked for. It refuses every other Library-project action.
 
 ## Requirements
 
@@ -50,6 +64,12 @@ Library-project action.
   the capabilities `library_import_pdf_v1`, `review_card_merge_v1` and
   `review_card_pending_moves_v1`, and a thoughts-cli with `merge-review-cards` and pending card
   moves; without them the tools answer `not_supported`.
+- Moving a card linked to source markers needs `review_card_move_pairs_v1` and thoughts-cli 1.7.0
+  (`move-card-passage`); without them `move_review_card` answers `server_unsupported` or
+  `not_supported`.
+- Links in notes need `agent_note_links_v1` (otherwise the note is sent without them, with a
+  warning); claims, topic owners and answering rules need `agent_note_claims_v1`,
+  `agent_note_owners_v1` and `agent_note_rules_v1`.
 
 ## Configuration
 
@@ -66,6 +86,9 @@ Library-project action.
 | `THOUGHTS_CHROME` | see `agent_notes.py` | Chromium/Chrome for rendering notes |
 | `THOUGHTS_DIARY_AUTHOR` | `user` | author name written on diary entries |
 | `THOUGHTS_DIARY_ZONE` | `Europe/Zurich` | time zone of diary entries and of "this week" in `knowledge_profile` |
+| `THOUGHTS_AGENT_CONVERSATION` | empty | for a connector process that serves one agent session: the conversation `send_note` and `get_note` use when the call names none |
+| `THOUGHTS_NOTE_ORIGIN` | `{}` | JSON object of extra `origin` fields for every note this process sends |
+| `THOUGHTS_RULES_IN_PROMPT` | unset | `1`: the agent has the answering rules in its prompt, so `get_note` names them instead of repeating them |
 
 ## Running it
 
@@ -91,7 +114,10 @@ thoughts.example.org {
 
 `thoughts-watch-replies` is an optional monitor for agents that run on the server host: it prints
 one line per reply the phone sends to a note of the connector, and tells the server that an agent
-listens. It uses the connector's token and `agent_notes.py` (`THOUGHTS_AGENT_NOTES`);
+listens. With `--conversation <id>` it listens only for that conversation's notes and the topics it
+owns (its polls keep those ownerships alive) and prints a `PAGE` line for each page the user sends
+on them; it starts by printing the user's answering rules (`RULES|` lines) when the server serves
+them. It uses the connector's token and `agent_notes.py` (`THOUGHTS_AGENT_NOTES`);
 `thoughts-watch-replies --check` tests the connection.
 
 Then add `https://<your host>/connector/mcp` as a custom connector in ChatGPT or Claude.
@@ -107,7 +133,7 @@ pip install pytest
 THOUGHTS_CLI=/path/to/thoughts-server/clients/thoughts-cli pytest tests
 ```
 
-Set `THOUGHTS_AGENT_NOTES=/path/to/thoughts-desktop/tools/mcp/agent_notes.py` to also run the test
+Set `THOUGHTS_AGENT_NOTES=/path/to/thoughts-desktop/tools/mcp/agent_notes.py` to also run the tests
 of `thoughts-watch-replies` (skipped without it).
 
 The tests run the connector against a fake Thoughts server and check every tool end to end through

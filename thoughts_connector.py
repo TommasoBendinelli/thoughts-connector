@@ -29,6 +29,9 @@ asks (merge_review_cards: thoughts-cli merge-review-cards, POST /v1/review-card-
 other cards with their markers and gives the kept card every passage, in one transaction, as Merge cards… on
 the Mac does), moving a card onto a pending proposal's text (move_review_card: thoughts-cli asks the server to
 wait for the proposal, POST /v1/review-card-pending-moves; the server moves the card when the user accepts it),
+moving a card linked to source markers with its marked passage (move_review_card with start_line equal to
+end_line: thoughts-cli move-card-passage writes two linked pending proposals in one source publication, as the
+Mac's thoughtsctl move-card-passage does; the user decides them as one),
 listing and cancelling such waiting moves (pending_card_moves, cancel_pending_card_move),
 and reading why a PDF does not build (build_status: GET /v1/render-status, /v1/builds/<id> and its
 source-diff, and the build log object).
@@ -43,7 +46,10 @@ source as this device, like the Mac's source publisher. Its request records (req
 in <state>/thoughts-cli.
 
 Notes are rendered from Markdown (with KaTeX math) to a PNG by agent_notes.py from the Thoughts
-plugin (copied next to this file by deploy.sh) with Chromium (THOUGHTS_CHROME).
+plugin (copied next to this file by deploy.sh) with Chromium (THOUGHTS_CHROME). The renderer
+measures every link of the note; send_note sends them as tappable rectangles of the picture
+(links, when the server has agent_note_links_v1), checking Library PDF links against the Library
+catalogue, as the Mac's send_note does against its PDF folder.
 
 Commands: serve (default) | set-passphrase [--stdin] | revoke-all | status
 """
@@ -134,14 +140,53 @@ ALLOWED = [(method, re.compile(f"^{pattern}$")) for method, pattern in (
     ("GET", r"/v1/review-card-pending-moves"),
     ("GET", f"/v1/review-card-pending-moves/{UUID}"),
     ("POST", f"/v1/review-card-pending-moves/{UUID}/cancel"),
+    # Who answers a reply or page (agent_note_claims_v1), topic owners (agent_note_owners_v1) and the user's answering
+    # rules (agent_note_rules_v1): get_note claims for the calling conversation; own_topic, release_topic, note_rules.
+    ("GET", f"/v1/agent-notes/handling/{UUID}"),
+    ("POST", f"/v1/agent-notes/handling/{UUID}/claim"),
+    ("GET", r"/v1/agent-notes/owners"),
+    ("POST", r"/v1/agent-notes/owners"),
+    ("DELETE", r"/v1/agent-notes/owners/[0-9a-f]{24}"),
+    ("DELETE", r"/v1/agent-notes/owners"),
+    ("GET", r"/v1/agent-notes/rules"),
 )]
+# Who answers (server capabilities); the reply agent's own MCP server sets the environment defaults below.
+CLAIMS_CAPABILITY = "agent_note_claims_v1"
+OWNERS_CAPABILITY = "agent_note_owners_v1"
+RULES_CAPABILITY = "agent_note_rules_v1"
+# The conversation this connector process answers for when a tool names none (the reply agent's session).
+DEFAULT_CONVERSATION = os.environ.get("THOUGHTS_AGENT_CONVERSATION", "").strip()
+# Extra origin fields for every note this process sends (the reply agent marks its notes as the responder's).
+try:
+    NOTE_ORIGIN = json.loads(os.environ.get("THOUGHTS_NOTE_ORIGIN") or "{}")
+except ValueError:
+    NOTE_ORIGIN = {}
+NOTE_ORIGIN = NOTE_ORIGIN if isinstance(NOTE_ORIGIN, dict) else {}
+# The reply agent has the rules in its prompt already: tools then name them instead of repeating them.
+RULES_IN_PROMPT = os.environ.get("THOUGHTS_RULES_IN_PROMPT") == "1"
 # The server capability import_pdf needs, and how long its download and import may take.
 IMPORT_CAPABILITY = "library_import_pdf_v1"
 IMPORT_SECONDS = 240
 # The server capability merge_review_cards needs.
 MERGE_CAPABILITY = "review_card_merge_v1"
+# The thoughts-cli command that moves a card linked to source markers with its passage (thoughts-cli 1.7.0), and
+# the server capability it needs: the server decides both halves of the move together.
+PASSAGE_MOVE_COMMAND = "move-card-passage"
+PASSAGE_MOVE_CAPABILITY = "review_card_move_pairs_v1"
 # The server capability for card moves that wait for a pending proposal (move_review_card, pending_card_moves).
 PENDING_MOVES_CAPABILITY = "review_card_pending_moves_v1"
+# Notes may carry links: rectangles of the picture that open a web page or a Library PDF page on the phone
+# (thoughts-server protocol/agent-notes.md, "Links"). The limits and forms are the server's.
+LINKS_CAPABILITY = "agent_note_links_v1"
+NOTE_WIDTH = 480  # CSS px of a rendered note (agent_notes.PAGE_WIDTH)
+MAX_NOTE_LINKS = 64
+MAX_LINK_HREF = 2048
+WEB_LINK = re.compile(r"https?://[^\s/?#]+", re.I)
+PDF_LINK = re.compile(r"thoughts-pdf-link:([A-Za-z0-9][A-Za-z0-9_.-]*\.pdf)\?page=[0-9]{1,6}"
+                      r"(?:&x=-?[0-9]+(?:\.[0-9]+)?)?(?:&y=-?[0-9]+(?:\.[0-9]+)?)?")
+# A Library PDF by filename, as Thoughts links write it (optionally behind ../docs-<folder>/), with a page as printed.
+LIBRARY_PDF_HREF = re.compile(r"(?:\.\./)*(?:[^/?#]+/)*([A-Za-z0-9][A-Za-z0-9_.-]*\.pdf)(?:#page=([0-9]{1,6}))?", re.I)
+OWN_PAGE_HREF = re.compile(r"#page=([0-9]{1,6})", re.I)
 # Operations the connector itself sends: add_diary_entry and link_conversation.
 OWN_OPERATIONS = frozenset({"logical_comment", "agent_conversation"})
 # create_document's three, and move_pdf's move_document (an imported PDF to another Project).
@@ -333,7 +378,8 @@ class Thoughts:
         return self.catalogue[1]["projects"]
 
     async def documents(self) -> dict[str, dict]:
-        """document_id -> {document_id, name, project, kind (tex|md|pdf), source_file, base, pdf_sha256, pages, published}.
+        """document_id -> {document_id, name, project, kind (tex|md|pdf), source_file, base, pdf_sha256, pages, published,
+        filename (the Library filename of its PDF, which links name)}.
 
         A document published in any Project is published; one only some Project lists in
         unpublished_documents is not (protocol/project-document-publication.md)."""
@@ -348,7 +394,7 @@ class Thoughts:
                         "document_id": d["document_id"], "name": d.get("name") or d.get("filename"), "project": project["name"],
                         "kind": kind, "source_file": source or None, "base": d.get("source_project") or "",
                         "pdf_sha256": d.get("sha256"), "pages": d.get("page_count"), "included": published,
-                        "published": published})
+                        "published": published, "filename": d.get("filename") or d.get("attachment_filename")})
         return out
 
     async def sources(self) -> dict[str, dict]:
@@ -528,6 +574,76 @@ def load_agent_notes():
     return module
 
 
+def note_link_target(href: str, own_pdf: str | None, library: dict[str, str] | None) -> tuple[str | None, str | None]:
+    """What the phone opens for a link as the agent wrote it, and a warning when it is dropped or doubtful.
+
+    As the Mac's agent_notes.resolve_link: https/http stay as they are; a Library PDF, written <filename>.pdf#page=N
+    (N as printed, 1-based) or #page=N for the note's own document (own_pdf), becomes
+    thoughts-pdf-link:<filename>.pdf?page=N-1. The filename is looked up in the Library as the server lists it
+    (library: casefolded filename -> filename; None when the catalogue could not be read), and written as the
+    Library writes it. A link the server would refuse is dropped, so it never costs the whole note."""
+    href = (href or "").strip()
+    if WEB_LINK.match(href):
+        return (href, None) if len(href) <= MAX_LINK_HREF else (
+            None, f"Link {href[:60]}… is longer than {MAX_LINK_HREF} characters; dropped.")
+    if href.lower().startswith("thoughts-pdf-link:"):
+        match = PDF_LINK.fullmatch(href)
+        if not match:
+            return None, f"Link {href[:200]} is not thoughts-pdf-link:<file>.pdf?page=<n>; dropped."
+        filename, rest = match.group(1), href[match.end(1):]
+    else:
+        match = OWN_PAGE_HREF.fullmatch(href)
+        if match:
+            if not own_pdf:
+                return None, (f"Link {href} opens a page of the note's own document, but the note has none whose PDF is "
+                              "known (give document_id); dropped.")
+            filename, page = own_pdf, match.group(1)
+        else:
+            match = LIBRARY_PDF_HREF.fullmatch(href)
+            if not match:
+                return None, (f"Link {href[:200]} is neither a web address (https://…) nor a Library PDF "
+                              "(<Library filename>.pdf#page=N); dropped.")
+            filename, page = match.group(1), match.group(2)
+        rest = f"?page={max(0, int(page or 1) - 1)}"
+    known = library.get(filename.casefold()) if library is not None else None
+    target = f"thoughts-pdf-link:{known or filename}{rest}"
+    if not PDF_LINK.fullmatch(target):
+        return None, f"Link {href[:200]}: {filename} is not a Library PDF filename; dropped."
+    if library is not None and known is None:
+        return target, (f"Link {href[:200]}: no Library PDF is named {filename} (list_documents shows each document's "
+                        "filename); the phone shows it as unavailable.")
+    return target, None
+
+
+def note_links(measured: list, css_height: int, own_pdf: str | None = None,
+               library: dict[str, str] | None = None) -> tuple[list, list]:
+    """The note's links in the server's form, made as the Mac's agent_notes.note_links makes them: each measured
+    rectangle ((href, [x, y, width, height] in CSS px of the page, linked text), from the renderer) as fractions of
+    the picture, with what the phone opens (note_link_target); and warnings."""
+    links, warnings, warned = [], [], set()
+    width, height = float(NOTE_WIDTH), float(max(1, css_height))
+    for href, (x, y, w, h), label in measured:
+        target, warning = note_link_target(href, own_pdf, library)
+        if warning and href not in warned:
+            warnings.append(warning)
+            warned.add(href)
+        if target is None:
+            continue
+        left, top = max(0.0, x), max(0.0, y)
+        right, bottom = min(width, x + w), min(height, y + h)
+        if right - left < 1 or bottom - top < 1:
+            continue  # cut off by the page's width or height
+        link = {"rect": [round(left / width, 6), round(top / height, 6), round((right - left) / width, 6),
+                         round((bottom - top) / height, 6)], "href": target}
+        if label:
+            link["label"] = label[:200]
+        links.append(link)
+    if len(links) > MAX_NOTE_LINKS:
+        warnings.append(f"The note has {len(links)} link rectangles; only the first {MAX_NOTE_LINKS} are kept.")
+        links = links[:MAX_NOTE_LINKS]
+    return links, warnings
+
+
 def card_summary(card: dict, history: list, docs: dict) -> dict:
     primary = card.get("primary") or {}
     doc = docs.get(primary.get("document_id") or "")
@@ -563,6 +679,28 @@ def waiting_text(body: dict) -> str:
     if current and current.get("state") != "waiting_for_proposal":
         lines.append(f"Now: {current['state']}" + (f" ({current['reason']})" if current.get("reason") else "")
                      + (f": {current['message']}" if current.get("message") else "") + ".")
+    return "\n".join(lines)
+
+
+def move_proposed_text(body: dict) -> str:
+    """move_review_card's answer for a card linked to source markers: two linked pending proposals."""
+    halves = {half["role"]: half for half in body["proposals"]}
+    cut, paste = halves["cut"], halves["paste"]
+    lines = [f"Proposed moving card {body['card_id']} with its marked passage from {cut['source']} to {paste['source']}"
+             + (" (replayed: already written by this request_id)" if body.get("replayed") else "")
+             + ". Nothing has moved yet: the user accepts or rejects the move in Thoughts, and deciding either "
+             "proposal decides both.",
+             f"- {cut['proposal_id']} at line {cut['line']} of {cut['source']} removes the passage "
+             f"(new source_sha256 {body['origin_source_sha256']})",
+             f"- {paste['proposal_id']} at line {paste['line']} of {paste['source']} inserts it "
+             f"(new source_sha256 {body['source_sha256']})",
+             "remove_proposal on either one withdraws both; they cannot be revised. Accepted, the card keeps its ID, "
+             "schedule and history and follows its markers when the notes are next built."]
+    if body.get("also_moved_card_ids"):
+        lines.append("Cards inside the passage that move with it: " + ", ".join(body["also_moved_card_ids"]) + ".")
+    lines += [f"Warning: {w['message']}" for w in body.get("warnings") or []]
+    if (body.get("render_check") or {}).get("status") == "failed":
+        lines.append(f"Warning: the rebuild could not be requested: {body['render_check'].get('message')}")
     return "\n".join(lines)
 
 
@@ -733,10 +871,19 @@ INSTRUCTIONS = (
     "knowledge_profile once for that topic and calibrate: skip or compress what is solid, explain shaky and not-understood "
     "points carefully. create_review_card makes a card from a note's passage and move_review_card moves a card on an "
     "imported PDF into a note, only when the user asks; onto a pending proposal's proposed text it waits and moves the "
-    "card when the user accepts that proposal (pending_card_moves lists such moves). To merge review cards into one card with several passages, "
+    "card when the user accepts that proposal (pending_card_moves lists such moves). To move a review card's marked "
+    "passage (between its \\ReviewCardMaskStart/End or <!-- thoughts:v1:start/end review:... --> marker lines) "
+    "elsewhere, e.g. when merging notes, never cut and paste it with two proposals and never ask the user to do it by "
+    "hand: call move_review_card with start_line equal to end_line, which proposes removing it here and inserting it "
+    "there as one decision for the user. To merge review cards into one card with several passages, "
     "when the user asks for it, call merge_review_cards once: never delete one card and edit another, or move markers "
-    "with proposals. send_note puts a picture (Markdown with $math$) on the user's phone, which they can draw on; "
-    "get_note shows their handwritten reply. add_diary_entry writes to their Diary. Library documents are never edited "
+    "with proposals. send_note puts a picture (Markdown with $math$ and tappable links) on the user's phone, which they can draw on; "
+    "get_note shows their handwritten reply. While you run you answer the replies to your own notes: pass your "
+    "conversation_id to send_note and get_note (get_note then claims the reply for you, so nobody answers twice, and "
+    "hands you the user's answering rules, also in note_rules: follow them whenever you answer a reply or page). The "
+    "Thoughts reply agent answers what no running agent covers. When the user makes you responsible for a topic, call "
+    "own_topic (and keep ~/.local/bin/thoughts-watch-replies --conversation <your id> running); release_topic ends it. "
+    "add_diary_entry writes to their Diary. Library documents are never edited "
     "directly: to suggest a change to a LaTeX or Markdown note, read it with read_source (exact lines and its source_sha256) "
     "and call create_proposals; the user accepts or rejects each proposal in Thoughts. revise_proposal changes a pending one, "
     "and remove_proposal withdraws a pending proposal you made (for example one that breaks the build). "
@@ -780,16 +927,16 @@ def create_app(service: core.Service = SERVICE, thoughts_url: str = THOUGHTS_URL
 
     @mcp.tool(name="list_documents", title="List Library documents", annotations=readonly)
     async def list_documents(query: str = "", project: str = "") -> CallToolResult:
-        """The Library's documents (id, name, project, kind: tex, md or pdf, pages, published), optionally only those
-        whose name or project contains query, or of one project. An unpublished document stays in its project but is
-        not built, and its review cards are not offered for review."""
+        """The Library's documents (id, name, project, kind: tex, md or pdf, pages, published, and the Library filename
+        of its PDF, which links name), optionally only those whose name or project contains query, or of one project.
+        An unpublished document stays in its project but is not built, and its review cards are not offered for review."""
         words = fold(query).split()
         docs = [d for d in (await thoughts.documents()).values()
                 if (not project or fold(project) in fold(d["project"])) and all(w in fold(f"{d['name']} {d['project']}") for w in words)]
         docs.sort(key=lambda d: (fold(d["project"]), fold(d["name"] or "")))
-        rows = [{k: d[k] for k in ("document_id", "name", "project", "kind", "pages", "published")} for d in docs]
-        text = "\n".join(f"[{d['project']}] {d['name']} ({d['kind']}{'' if d['published'] else ', unpublished'}, id {d['document_id']})"
-                         for d in docs)
+        rows = [{k: d[k] for k in ("document_id", "name", "project", "kind", "pages", "published", "filename")} for d in docs]
+        text = "\n".join(f"[{d['project']}] {d['name']} ({d['kind']}{'' if d['published'] else ', unpublished'}, "
+                         + (f"file {d['filename']}, " if d["filename"] else "") + f"id {d['document_id']})" for d in docs)
         return result(f"{len(docs)} document(s):\n{text}", {"documents": rows})
 
     @mcp.tool(name="read_document", title="Read a document", annotations=readonly)
@@ -1130,10 +1277,14 @@ def create_app(service: core.Service = SERVICE, thoughts_url: str = THOUGHTS_URL
         return result(f"{len(rows)} note(s):\n{text}", {"notes": rows})
 
     @mcp.tool(name="get_note", title="A note and the user's replies", annotations=notes_ro)
-    async def get_note(note_id: str, wait_for_reply_s: int = 0, include_note_image: bool = False) -> CallToolResult:
+    async def get_note(note_id: str, wait_for_reply_s: int = 0, include_note_image: bool = False,
+                       conversation_id: str = "") -> CallToolResult:
         """One note with the user's replies as images (what they drew or wrote on the phone, and a photo from their
-        glasses when they used Send with picture). wait_for_reply_s (at most 45) waits for a first reply to a note
-        this connector sent; while it waits the phone tells the user an agent is listening."""
+        glasses when they used Send with picture), or a page the user sent. wait_for_reply_s (at most 45) waits for a
+        first reply to a note this connector sent; while it waits the phone tells the user an agent is listening.
+        With conversation_id (your conversation's id), each reply (or the page) is claimed for you when you cover it
+        (your note, or a topic you own): "yours" means answer it, following the user's answering rules (given here);
+        "taken" means another agent answers it; "not yours" means leave it to the agent that covers it."""
         if not re.fullmatch(UUID, note_id):
             raise LookupError("note_id must be a note's UUID")
         note = (await thoughts.request("GET", f"/v1/agent-notes/{note_id}")).json()
@@ -1158,13 +1309,149 @@ def create_app(service: core.Service = SERVICE, thoughts_url: str = THOUGHTS_URL
             if photo:
                 data = (await thoughts.request("GET", f"/v1/agent-notes/replies/{reply['reply_id']}/photo")).content
                 images.append(ImageContent(type="image", data=base64.b64encode(data).decode(), mimeType=photo.get("media_type") or "image/jpeg"))
+        conversation = (conversation_id or DEFAULT_CONVERSATION).strip()
+        page = isinstance(note.get("origin"), dict) and note["origin"].get("kind") == "phone_page"
+        handling = await claim_items([note_id] if page else [r["reply_id"] for r in replies], conversation)
+        for reply in replies:
+            reply["handling"] = handling.get(reply["reply_id"])
         summary = {"note_id": note_id, "title": note.get("title"), "message": note.get("message"),
                    "opened_at": note.get("opened_at"), "replies": replies}
+        if page:
+            summary["page_handling"] = handling.get(note_id)
         text = (f"{note.get('title')}: {len(replies)} repl{'y' if len(replies) == 1 else 'ies'}"
                 + "".join(f"\n- {r['created_at'][:16]}" + (f": {r['message']}" if r.get("message") else "")
                           + (f" [with a photo from the glasses: {r['photo_capture'] or 'attached'}; act on the words with it]"
-                             if r["has_photo"] else "") for r in replies))
+                             if r["has_photo"] else "")
+                          + (f" ({handling_words(r['handling'])})" if r.get("handling") else "") for r in replies)
+                + (f"\nThis page: {handling_words(handling[note_id])}." if page and handling.get(note_id) else ""))
+        if any((value or {}).get("state") == "yours" for value in handling.values()):
+            text += "\n\n" + await rules_block()
         return result(text, summary, images)
+
+    async def claim_items(item_ids: list[str], conversation: str) -> dict:
+        """Claims each reply or page for the conversation when it covers it (agent_note_claims_v1); item -> state."""
+        if not item_ids or not conversation:
+            return {}
+        try:
+            if CLAIMS_CAPABILITY not in ((await thoughts.ttl("health", "/v1/health")).get("capabilities") or []):
+                return {}
+        except ThoughtsError:
+            return {}
+        out = {}
+        for item_id in item_ids:
+            try:
+                response = await thoughts.request("POST", f"/v1/agent-notes/handling/{item_id}/claim", refusals=True,
+                                                  body={"conversation_id": conversation, "only_if_covering": True})
+                answer = response.json()
+            except (ThoughtsError, ValueError) as error:
+                out[item_id] = {"state": "unknown", "detail": str(error)}
+                continue
+            claim = answer.get("claim") if isinstance(answer.get("claim"), dict) else None
+            state = ("yours" if answer.get("claimed") else
+                     "taken" if answer.get("error_code") == "agent_note_claimed" else "not_yours")
+            out[item_id] = {"state": state, "claim": claim}
+        return out
+
+    def handling_words(value: dict) -> str:
+        claim = value.get("claim") or {}
+        if value.get("state") == "yours":
+            return "yours to answer: answer it following the user's answering rules"
+        if value.get("state") == "taken":
+            who = "the Thoughts reply agent" if claim.get("role") == "responder" else (
+                f"another agent ({claim.get('device_id')}" + (f", conversation {claim['conversation_id']}"
+                                                              if claim.get("conversation_id") else "") + ")")
+            return f"{who} answers it; do not answer it again"
+        if value.get("state") == "not_yours":
+            return "not yours: the agent that covers it answers it; answer only if the user asks you"
+        return "who answers it is unknown"
+
+    async def rules_block() -> str:
+        if RULES_IN_PROMPT:
+            return "Follow the user's answering rules (in your instructions)."
+        rules = await answering_rules()
+        if not rules.get("text"):
+            return f"The user's answering rules are not available ({rules.get('missing')})."
+        return "The user's answering rules (follow them when you answer):\n" + rules["text"]
+
+    async def answering_rules() -> dict:
+        try:
+            if RULES_CAPABILITY not in ((await thoughts.ttl("health", "/v1/health")).get("capabilities") or []):
+                return {"text": None, "missing": "this Thoughts server does not serve answering rules yet"}
+            response = await thoughts.request("GET", "/v1/agent-notes/rules", refusals=True)
+        except ThoughtsError as error:
+            return {"text": None, "missing": str(error)}
+        answer = response.json()
+        if response.status_code >= 400 or not isinstance(answer.get("text"), str):
+            return {"text": None, "missing": "the Library has no note named agent-note-rules.md yet"}
+        return {key: answer.get(key) for key in ("text", "sha256", "source_path", "revision", "updated_at")}
+
+    @mcp.tool(name="note_rules", title="The user's answering rules", annotations=notes_ro)
+    async def note_rules() -> CallToolResult:
+        """The user's rules for answering their replies, pages and glasses captures, the same for every agent on every
+        computer: the Library note agent-note-rules.md as the user accepted it. Follow them whenever you answer a reply
+        or a page. The user changes them by editing that note."""
+        rules = await answering_rules()
+        return result(rules.get("text") or f"Not available: {rules.get('missing')}", rules)
+
+    @mcp.tool(name="own_topic", title="Become responsible for a topic's notes",
+              annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, openWorldHint=False, idempotentHint=True))
+    async def own_topic(
+        conversation_id: Annotated[str, Field(min_length=1, max_length=128, description="Your conversation's id (the same one you pass to send_note and get_note, and to thoughts-watch-replies --conversation).")],
+        label: Annotated[str, Field(min_length=1, max_length=200, description="What the topic is, as the user named it, e.g. Linear algebra.")],
+        project: Annotated[str, Field(max_length=512, description="A Library Project whose documents are the topic (its name or id); its current documents are taken.")] = "",
+        document_ids: list[str] | None = None,
+        review_card_ids: list[str] | None = None,
+        title_tags: Annotated[list[str] | None, Field(description="A note is in the topic when its title contains one of these (any case), e.g. [Linear algebra].")] = None,
+        captures: Annotated[bool, Field(description="You also answer the glasses captures (the reply agent then leaves them to the owners).")] = False,
+    ) -> CallToolResult:
+        """Only when the user makes you responsible for the agent notes of a topic: replies to notes in the topic
+        (whoever sent them) and pages the user sends on it come to you, and the Thoughts reply agent steps aside while
+        you listen (it answers after 10 minutes what is left unanswered). It lasts while you keep
+        ~/.local/bin/thoughts-watch-replies --conversation <conversation_id> running; release_topic ends it."""
+        try:
+            capabilities = (await thoughts.ttl("health", "/v1/health")).get("capabilities") or []
+        except ThoughtsError as error:
+            return result(f"Not done: {error}", {"error_code": "unavailable"}, error=True)
+        if OWNERS_CAPABILITY not in capabilities:
+            return result("This Thoughts server does not support topic owners yet.", {"error_code": "unsupported"},
+                          error=True)
+        documents = list(document_ids or [])
+        if project:
+            docs = await thoughts.documents()
+            matched = [d for d in docs.values() if fold(d["project"]) == fold(project)]
+            if not matched:
+                return result(f"No Project {project!r}; list_documents shows the Projects.", {"error_code": "not_found"},
+                              error=True)
+            documents += [d["document_id"] for d in matched if d["document_id"] not in documents]
+        body = {"conversation_id": conversation_id, "label": label, "document_ids": documents,
+                "review_card_ids": list(review_card_ids or []), "title_tags": list(title_tags or []), "captures": captures}
+        try:
+            owner = (await thoughts.request("POST", "/v1/agent-notes/owners", body=body)).json()
+        except ThoughtsError as error:
+            return result(f"Not done: {error}", {"error_code": "refused"}, error=True)
+        core.log(f"topic owner {owner.get('owner_id')}: {label!r} for conversation {conversation_id}")
+        return result(f"You own the topic {label!r} (owner_id {owner.get('owner_id')}): {len(documents)} document(s), "
+                      f"{len(body['review_card_ids'])} card(s), tags {body['title_tags']}"
+                      + (", and the glasses captures" if captures else "")
+                      + f". Keep ~/.local/bin/thoughts-watch-replies --conversation {conversation_id} running as a "
+                      "background monitor: the ownership lasts while it listens.", owner)
+
+    @mcp.tool(name="release_topic", title="Stop being responsible for a topic",
+              annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, openWorldHint=False, idempotentHint=True))
+    async def release_topic(owner_id: str = "", conversation_id: str = "") -> CallToolResult:
+        """When the user takes a topic back (or hands it to another agent): ends one ownership (owner_id), or every topic
+        your conversation owns (conversation_id). The Thoughts reply agent then answers those replies and pages again."""
+        try:
+            if re.fullmatch(r"[0-9a-f]{24}", owner_id or ""):
+                await thoughts.request("DELETE", f"/v1/agent-notes/owners/{owner_id}")
+            elif conversation_id:
+                await thoughts.request("DELETE", "/v1/agent-notes/owners", params={"conversation_id": conversation_id})
+            else:
+                return result("Name the topic (owner_id) or your conversation (conversation_id).",
+                              {"error_code": "invalid"}, error=True)
+        except ThoughtsError as error:
+            return result(f"Not done: {error}", {"error_code": "refused"}, error=True)
+        return result("Released.", {"owner_id": owner_id or None, "conversation_id": conversation_id or None})
 
     @mcp.tool(name="add_diary_entry", title="Add a diary entry",
               annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, openWorldHint=False, idempotentHint=False))
@@ -1192,36 +1479,94 @@ def create_app(service: core.Service = SERVICE, thoughts_url: str = THOUGHTS_URL
         return result(f"Added to the Diary ({now.strftime('%d.%m.%Y %H:%M')}). It appears on the phone and desktop after their next Sync.",
                       {"entry_id": entry_id, "diary_at": payload["diary_at"]})
 
+    async def rendered_links(rendered, document_id: str, warnings: list) -> list:
+        """The links of a rendered note in the server's form, or [] (with a warning) when the server cannot take them.
+
+        Library PDF links are checked against the Library the server lists; #page=N links name the PDF of the note's
+        document (document_id)."""
+        measured = list(getattr(rendered, "links", None) or [])  # a renderer from before links measures none
+        if not measured:
+            return []
+        library, own_pdf = None, None
+        if any(not WEB_LINK.match((href or "").strip()) for href, _rect, _label in measured):
+            try:
+                docs = await thoughts.documents()
+            except ThoughtsError as error:
+                warnings.append(f"Links to Library PDFs were not checked: the Library catalogue is unavailable ({error}).")
+            else:
+                library = {d["filename"].casefold(): d["filename"] for d in docs.values() if d.get("filename")}
+                own_pdf = (docs.get(document_id) or {}).get("filename") if document_id else None
+        links, link_warnings = note_links(measured, getattr(rendered, "css_height", 0) or 0, own_pdf, library)
+        warnings.extend(link_warnings)
+        if not links:
+            return []
+        try:
+            capabilities = (await thoughts.ttl("health", "/v1/health")).get("capabilities") or []
+        except ThoughtsError as error:
+            core.log(f"send_note: no server capabilities ({error})")
+            capabilities = []
+        if LINKS_CAPABILITY not in capabilities:
+            warnings.append(f"The Thoughts server does not support links yet ({LINKS_CAPABILITY}); the note was sent without them.")
+            return []
+        return links
+
     @mcp.tool(name="send_note", title="Send a note to the phone",
               annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, openWorldHint=False, idempotentHint=False))
-    async def send_note(title: str, markdown: str, message: str = "", document_id: str = "", review_card_id: str = "") -> CallToolResult:
+    async def send_note(title: str, markdown: str, message: str = "", document_id: str = "", review_card_id: str = "",
+                        conversation_id: str = "") -> CallToolResult:
         """Put a note on the user's phone: markdown (headings, lists, tables, $inline$ and $$display$$ math) rendered
-        as a phone-width picture the user can draw on. Optionally tie it to a document or review card. Use
-        get_note with wait_for_reply_s to see their answer."""
+        as a phone-width picture the user can draw on. Optionally tie it to a document or review card. Pass your
+        conversation_id, so the note is yours: you answer its replies while you run (get_note with your
+        conversation_id claims them; keep ~/.local/bin/thoughts-watch-replies --conversation <id> running). When the
+        note answers a reply or a page, follow the user's answering rules (note_rules).
+        Links become tappable areas of the picture: [text](https://…) opens a web page, [p. 53](<Library filename>.pdf#page=53)
+        opens that page (as printed) of a Library PDF (list_documents shows each document's filename), and [p. 4](#page=4)
+        a page of the note's own document (document_id). Other links are dropped with a warning."""
         notes = load_agent_notes()
         rendered = await asyncio.to_thread(notes.render, markdown=markdown)
+        warnings = list(rendered.warnings)
+        links = await rendered_links(rendered, document_id, warnings)
         body = {"note_id": str(uuid.uuid4()), "title": title[:200],
                 "image": {"media_type": "image/png", "data_base64": base64.b64encode(rendered.png).decode()},
-                "origin": {"agent": "connector"}}
+                "origin": {"agent": "connector", **NOTE_ORIGIN}}
+        conversation = (conversation_id or DEFAULT_CONVERSATION).strip()
+        if conversation:
+            body["origin"]["conversation_id"] = conversation[:128]
         if message:
             body["message"] = message[:4000]
         if document_id:
             body["document_id"] = document_id
         if review_card_id:
             body["review_card_id"] = review_card_id
+        if links:
+            body["links"] = links
         sent = (await thoughts.request("POST", "/v1/agent-notes", body=body, timeout=60)).json()
+        note = sent.get("note") if isinstance(sent.get("note"), dict) else {}
+        if links and "links" not in note:
+            warnings.append(f"The Thoughts server did not keep the links ({LINKS_CAPABILITY}); the note has none.")
+        kept = [{"href": link.get("href"), "label": link.get("label", "")} for link in note.get("links") or []]
         live = bool((sent.get("delivery") or {}).get("live"))
-        # Whether an agent here hears the user's reply (thoughts-watch-replies, or get_note waiting); servers before
-        # agent_note_listening_v1 cannot tell.
-        heard = (sent.get("reply_listening") or {}).get("state") or "unknown"
-        core.log(f"note sent: {title!r} ({'phone listening' if live else 'phone not listening'}, replies {heard})")
-        text = (f"Sent '{title}' (note {body['note_id']}). "
+        # Who hears the user's reply: this conversation (its watcher, or get_note waiting), a topic owner, or the reply
+        # agent; servers before agent_note_listening_v1 cannot tell.
+        listening = sent.get("reply_listening") or {}
+        heard = listening.get("state") or "unknown"
+        rows = [row for row in listening.get("listeners") or [] if isinstance(row, dict)]
+        responder = any(row.get("responder") for row in rows)
+        own = any(row.get("role", "sender") == "sender" and not row.get("responder") for row in rows)
+        core.log(f"note sent: {title!r} ({'phone listening' if live else 'phone not listening'}, replies {heard}"
+                 + (f", {len(kept)} link(s)" if kept else "") + ")")
+        text = (f"Sent '{title}' (note {body['note_id']})"
+                + (f" with {len(kept)} tappable link{'' if len(kept) == 1 else 's'}" if kept else "") + ". "
                 + ("The phone is open and shows it now." if live else "The phone will show it when Thoughts is opened.")
-                + (" Nothing here is listening for the user's reply, and the phone shows them so: wait with get_note "
-                   "(wait_for_reply_s), or keep thoughts-watch-replies running as a monitor." if heard == "not_listening" else "")
-                + (" Warnings: " + "; ".join(rendered.warnings) if rendered.warnings else ""))
+                + ("" if own or heard == "unknown" else
+                   " Nothing of yours listens for the user's reply yet: keep ~/.local/bin/thoughts-watch-replies "
+                   "--conversation <your id> running as a background monitor (pass that id to send_note), or wait with "
+                   "get_note (wait_for_reply_s)" + ("; meanwhile the Thoughts reply agent covers it." if responder else
+                                                    ", or the phone tells the user nobody listens."))
+                + (" Warnings: " + "; ".join(warnings) if warnings else ""))
         return result(text, {"note_id": body["note_id"], "phone_listening": live, "reply_listening": heard,
-                             "warnings": rendered.warnings})
+                             "reply_agent_listening": responder,
+                             "links": kept, "warnings": warnings})
 
     async def source_path(source: str) -> str:
         """A source path as GET /v1/sources lists it, or the main source of a document id or name."""
@@ -1316,10 +1661,15 @@ def create_app(service: core.Service = SERVICE, thoughts_url: str = THOUGHTS_URL
         if body.get("state") == "proposal_removed":
             outcome = next((d.get("outcome") for d in body.get("proposal_decisions") or []), None)
             core.log(f"proposals: withdrew {body['proposal_id']} in {body['source']} ({outcome})")
+            pair = body.get("withdrawn_proposal_ids") or []
             return result(
                 f"Withdrew proposal {body['proposal_id']} at line {body['line']} of {body['source']}"
                 + (" (replayed: already done by this request_id)" if body.get("replayed") else "")
                 + f"; its original text is restored, new source_sha256 {body['source_sha256']}. "
+                + (f"It was half of a card move, so the other half ({next((p for p in pair if p != body['proposal_id']), '')}"
+                   + (f" in {body['other_source']}, new source_sha256 {body['other_source_sha256']}"
+                      if body.get("other_source") else " in the same source")
+                   + ") was withdrawn with it and the card stays where it was. " if pair else "")
                 + ("Thoughts records it as withdrawn by the agent." if outcome in ("matched", "matched_late")
                    else f"The server's decision outcome: {outcome}." if outcome else ""), body)
         proposals = body.get("proposals") or [body]
@@ -1373,7 +1723,9 @@ def create_app(service: core.Service = SERVICE, thoughts_url: str = THOUGHTS_URL
         figures: Annotated[list[ProposalFigure] | None, Field(default=None, max_length=20, description=FIGURES_FIELD + " On a revision a figure of the same name that this proposal added is replaced.")] = None,
     ) -> CallToolResult:
         """Change the proposed text and explanation of a pending proposal; its original text, ID, timestamp and
-        conversation stay as created. Never accepts or rejects it. figures adds or replaces this proposal's SVG drawings."""
+        conversation stay as created. Never accepts or rejects it. figures adds or replaces this proposal's SVG drawings.
+        The two halves of a card move (IDs ending in .cut and .paste, from move_review_card) cannot be revised
+        (move_proposal): withdraw the move with remove_proposal and move the card again."""
         payload = {"command": "revise-proposal", "source": source, "expected_source_sha256": expected_source_sha256,
                    "proposal_id": proposal_id, "replacement": replacement, "explanation": explanation,
                    "conversation_id": conversation_id, "request_id": request_id}
@@ -1395,8 +1747,10 @@ def create_app(service: core.Service = SERVICE, thoughts_url: str = THOUGHTS_URL
         """Withdraw a pending agent proposal: its wrapper is removed and its captured original text restored, exactly
         as Reject would leave the note. Use it to take back a proposal you made, for example one that breaks the build;
         other proposals are kept. It is not a decision about the user's text: the user still accepts or rejects
-        proposals in Thoughts, and Thoughts records this one as withdrawn by the agent. Retry an uncertain call only
-        with identical arguments and the same request_id."""
+        proposals in Thoughts, and Thoughts records this one as withdrawn by the agent. Withdrawing either half of a
+        card move (an ID ending in .cut or .paste, from move_review_card) withdraws both halves, also when the other
+        is in another source, and the card stays where it was. Retry an uncertain call only with identical arguments
+        and the same request_id."""
         return await author({"command": "remove-proposal", "source": source, "expected_source_sha256": expected_source_sha256,
                              "proposal_id": proposal_id, "explanation": explanation,
                              "conversation_id": conversation_id, "request_id": request_id})
@@ -1668,34 +2022,81 @@ def create_app(service: core.Service = SERVICE, thoughts_url: str = THOUGHTS_URL
                                    "end_line": end_line, "question": question, "due_at": due_at,
                                    "request_id": request_id})
 
-    @mcp.tool(name="move_review_card", title="Move a review card into a note", annotations=card_tool)
+    @mcp.tool(name="move_review_card", title="Move a review card", annotations=card_tool)
     async def move_review_card(
         card_id: Annotated[str, Field(pattern=UUID_FIELD, description="Card to move (card_id from review_cards or get_review_card).")],
-        source: Annotated[str, Field(min_length=1, description="Source path from read_source: the main .tex or .md source of the note to move it into.")],
+        source: Annotated[str, Field(min_length=1, description="Source path from read_source: the .tex or .md source to move it into (for a card without markers, the note's main source).")],
         expected_source_sha256: Annotated[str, Field(pattern=r"^[0-9a-f]{64}$", description="source_sha256 from read_source; a changed source is refused (source_conflict).")],
-        start_line: Annotated[LineBoundary, Field(description="One-based first complete source line of the card's new answer.")],
-        end_line: Annotated[LineBoundary, Field(description="Exclusive end line of the continuous answer range.")],
+        start_line: Annotated[LineBoundary, Field(description="Card without source markers: one-based first complete source line of its new answer. Card linked to markers: the line before which its marked passage is inserted (equal to end_line; lines + 1 appends).")],
+        end_line: Annotated[LineBoundary, Field(description="Card without source markers: exclusive end line of the continuous answer range. Card linked to markers: equal to start_line.")],
         request_id: Annotated[str, Field(pattern=UUID_FIELD, description="Fresh random UUID for this call. Retry an uncertain call only with identical arguments and the same request_id.")],
+        explanation: Annotated[str | None, Field(min_length=1, max_length=100000, description="Card linked to markers only: why the passage moves, shown with both proposals. Do not write the card's ID in it.")] = None,
+        conversation_id: Annotated[str | None, Field(pattern=UUID_FIELD, description="Card linked to markers only: this conversation's UUID, as for create_proposals, recorded in both proposals.")] = None,
     ) -> CallToolResult:
-        """Move a review card that has no source markers yet (for example a card on an imported paper's PDF) into a
-        note, as the Mac's move-review-card does: the card keeps its ID, question, review history and schedule, and its
-        answer becomes the selected source lines, marked like create_review_card (same selection rules). Use it only when
-        the user asks to move a card. A card already linked to source markers is refused (linked_card): the user moves
-        it in Thoughts by cutting its marked passage and pasting it into the other note.
+        """Move a review card to another place of the Library; it keeps its ID, question, review history and schedule.
 
-        The new home may be text that is still a pending agent proposal: select the lines of its proposed text (in
-        read_source, the last argument of \\agentProposedEdit, or the text between a Markdown proposal's header and
-        its end comment; the wrapper's own "}{" or closing "}" on those lines is fine, its explanation and original text
-        are not). Then nothing changes yet: the result is state waiting_for_proposal with the proposal_id and a
-        pending_move_id, and Thoughts moves the card by itself when the user accepts that proposal, exactly as it would
-        move it onto the accepted text. Do not ask the user to accept first or to call again. If the user rejects the
-        proposal or it is withdrawn, or revised so that those lines are gone, or the card is deleted or moved another
-        way first, the move is dropped and the card stays where it was. pending_card_moves shows such moves (also in
-        get_review_card) and cancel_pending_card_move cancels one. An older Thoughts server refuses lines inside a
-        pending proposal (invalid_selection)."""
-        return await card_command({"command": "move-review-card", "card_id": card_id, "source": source,
-                                   "expected_source_sha256": expected_source_sha256, "start_line": start_line,
-                                   "end_line": end_line, "request_id": request_id})
+        Card linked to source markers (its passage stands between \\ReviewCardMaskStart/End lines, in Markdown
+        between <!-- thoughts:v1:start/end review:... --> lines): give start_line equal to end_line, the line of
+        `source` before which the passage goes, with explanation and conversation_id. Its marked passage, markers
+        included, then moves there: `source` may be the card's own source, another source of the same folder, or a
+        source of another folder or Project, of the same format (LaTeX to LaTeX, Markdown to Markdown). Read the
+        destination with read_source first. Nothing moves yet: Thoughts writes two linked pending proposals, one
+        removing the passage where it is (agent-<uuid>.cut) and one inserting it there (agent-<uuid>.paste), and the
+        user accepts or rejects them as one in Thoughts (deciding either decides both). Never cut and paste a card's
+        passage with create_proposals, and never ask the user to cut and paste it by hand. remove_proposal on either
+        half withdraws both; they cannot be revised. Choose a line between complete paragraphs or blocks of the
+        document body: the call fails with invalid_destination if the markers would not read back there after
+        acceptance, and with invalid_link if a link in the passage would not resolve from its new place (propose a
+        fix of those links first). A passage that intersects a pending proposal cannot move (proposal_overlap), nor
+        one that holds only some of another card's markers (split_card); other cards wholly inside the passage move
+        with it (also_moved_card_ids). Other errors: pdf_only_card (the card has no markers: select its new answer
+        with start_line < end_line), unsupported_card, format_mismatch, invalid_range, no_change, source_conflict,
+        generated_source, server_unsupported or not_supported (an older Thoughts server or thoughts-cli: only then
+        does the user move the passage by hand).
+
+        Card without source markers yet (for example a card on an imported paper's PDF): give start_line < end_line,
+        the complete lines of the note's main source that become its answer, marked like create_review_card (same
+        selection rules), at once, as the Mac's move-review-card does. Use it only when the user asks to move a card.
+        A card linked to markers is refused with a line range (linked_card): call again with start_line equal to
+        end_line as above.
+
+        The new home of a card without markers may be text that is still a pending agent proposal: select the lines
+        of its proposed text (in read_source, the last argument of \\agentProposedEdit, or the text between a
+        Markdown proposal's header and its end comment; the wrapper's own "}{" or closing "}" on those lines is fine,
+        its explanation and original text are not). Then nothing changes yet: the result is state
+        waiting_for_proposal with the proposal_id and a pending_move_id, and Thoughts moves the card by itself when
+        the user accepts that proposal, exactly as it would move it onto the accepted text. Do not ask the user to
+        accept first or to call again. If the user rejects the proposal or it is withdrawn, or revised so that those
+        lines are gone, or the card is deleted or moved another way first, the move is dropped and the card stays
+        where it was. pending_card_moves shows such moves (also in get_review_card) and cancel_pending_card_move
+        cancels one. An older Thoughts server refuses lines inside a pending proposal (invalid_selection)."""
+        payload = {"command": "move-review-card", "card_id": card_id, "source": source,
+                   "expected_source_sha256": expected_source_sha256, "start_line": start_line,
+                   "end_line": end_line, "request_id": request_id}
+        if start_line == end_line:
+            def refused(code: str, message: str) -> CallToolResult:
+                return result(f"Nothing was written ({code}): {message}",
+                              {"accepted": False, "error_code": code, "message": message}, error=True)
+
+            if explanation is None or conversation_id is None:
+                return refused("invalid_request", "Moving a card linked to source markers (start_line equal to "
+                               "end_line) needs explanation and conversation_id.")
+            try:
+                capabilities = (await thoughts.ttl("health", "/v1/health")).get("capabilities") or []
+                commands = load_thoughts_cli().client.COMMANDS
+            except ThoughtsError as error:
+                return refused("not_available", str(error))
+            if PASSAGE_MOVE_CAPABILITY not in capabilities:
+                return refused("server_unsupported", "this Thoughts server cannot decide the two halves of a card move "
+                               f"together yet (it lacks {PASSAGE_MOVE_CAPABILITY}); until it can, the user moves the "
+                               "card by cutting its marked passage and pasting it into the other source.")
+            if PASSAGE_MOVE_COMMAND not in commands:
+                return refused("not_supported", "the thoughts-cli installed next to the connector cannot move a card "
+                               f"linked to source markers yet (it needs {PASSAGE_MOVE_COMMAND}, thoughts-cli 1.7.0); "
+                               "until it can, the user moves the card by cutting its marked passage and pasting it "
+                               "into the other source.")
+            payload.update(explanation=explanation, conversation_id=conversation_id)
+        return await card_command(payload)
 
     merge_tool = ToolAnnotations(readOnlyHint=False, destructiveHint=True, openWorldHint=False, idempotentHint=True)
     CardId = Annotated[str, Field(pattern=UUID_FIELD)]
@@ -1790,6 +2191,11 @@ def create_app(service: core.Service = SERVICE, thoughts_url: str = THOUGHTS_URL
             core.log(f"review card: {body['card_id']} waits for proposal {body['proposal_id']} in {body['source']}"
                      + (" (replayed)" if body.get("replayed") else ""))
             return result(waiting_text(body), body)
+        if body.get("state") == "move_proposed":
+            thoughts.cached.pop("sources", None)
+            core.log(f"review card: move of {body['card_id']} proposed, {body['origin_source']} -> {body['source']}"
+                     + (" (replayed)" if body.get("replayed") else ""))
+            return result(move_proposed_text(body), body)
         # The marked source and the new or moved card: read them fresh next time.
         thoughts.cached.pop("sources", None)
         thoughts.cached.pop("projections", None)

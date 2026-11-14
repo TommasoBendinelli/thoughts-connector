@@ -72,8 +72,8 @@ def feedback(feedback_id: str, document_id: str, pdf_sha256: str, created_at: st
                            "pdf": {"document_id": document_id, "pdf_sha256": pdf_sha256,
                                    "regions": [{"page": page, "rect": [0.1, 0.5, 0.9, 0.52]},
                                                {"page": page + 1, "rect": [0.1, 0.0, 0.5, 0.02]}]}},
-                "revision": 1, "created_at": created_at, "updated_at": created_at, "created_origin_id": "android-cph2719",
-                "origin_id": "android-cph2719", "deleted": deleted}}
+                "revision": 1, "created_at": created_at, "updated_at": created_at, "created_origin_id": "android-example-phone",
+                "origin_id": "android-example-phone", "deleted": deleted}}
 
 
 def obj(text: str) -> tuple[str, bytes]:
@@ -154,6 +154,7 @@ PROJECTIONS = {"projections": [
     feedback(REMOVED, "doc-rp", "a" * 64, "2026-10-27T08:00:00.000Z", deleted=True),
     feedback(OTHER, GONE_DOC, "e" * 64, "2026-10-27T08:00:00.000Z"),
 ]}
+MEASURED = TMP / "measured_links.json"  # what the stub renderer measures: {"css_height", "links"}
 REQUESTS: list[tuple[str, str, str]] = []  # method, path, Authorization
 POSTED: list[dict] = []
 PUBLISHED: list[dict] = []
@@ -161,7 +162,18 @@ LIBRARY_CHANGES: list[dict] = []
 URL_IMPORTS: list[dict] = []  # bodies of POST /v1/library/url-imports
 OPERATIONS: list[dict] = []  # thoughts-cli's review-card operations
 CAPABILITIES = ["client_review_sources_v1", "client_review_source_replacement_v1", "client_review_card_move_v1",
-                "library_import_pdf_v1", "review_card_merge_v1", "review_card_pending_moves_v1"]
+                "library_import_pdf_v1", "review_card_merge_v1", "review_card_pending_moves_v1", "agent_note_links_v1",
+                "review_card_move_pairs_v1",
+                "agent_note_claims_v1", "agent_note_owners_v1", "agent_note_rules_v1"]
+# Who answers: claims (path, body), how the fake answers each item, topic owners posted, deletions.
+CLAIMS: list[tuple[str, dict]] = []
+CLAIM_OUTCOMES: dict[str, str] = {}  # item id -> "yours" (default), "responder", "not_covering"
+OWNERS_POSTED: list[dict] = []
+DELETES: list[tuple[str, dict]] = []
+RULES_TEXT = "# Answering rules\nAnswer in plain words.\n"
+CLAIM_NOTE = "3c4d5e6f-7a8b-4c9d-8e0f-1a2b3c4d5e6f"
+CLAIM_REPLY = "4d5e6f7a-8b9c-4d0e-9f1a-2b3c4d5e6f7a"
+CLAIM_PAGE = "5e6f7a8b-9c0d-4e1f-8a2b-3c4d5e6f7a8b"
 PENDING_MOVES: dict[str, tuple[dict, dict]] = {}  # request_id -> (request, current view); POST /v1/review-card-pending-moves
 MERGES: list[dict] = []  # bodies of POST /v1/review-card-merges
 MERGE_RECEIPTS: dict[str, tuple[dict, dict]] = {}  # request_id -> (request, first answer)
@@ -176,6 +188,15 @@ NOTE_RECORD = {"note_id": NOTE, "title": "Whiteboard", "message": "your plot", "
                "sender_device_id": "thoughts-mac", "media_type": "image/png", "opened_at": None,
                "replies": [{"reply_id": "r1", "created_at": "2026-10-21T15:00:00Z", "message": "like this?",
                             "image_url": "/v1/agent-notes/replies/r1/image", "media_type": "image/png", "stroke_count": 12}]}
+CLAIM_NOTE_RECORD = {"note_id": CLAIM_NOTE, "title": "Eigenvalues", "message": None, "created_at": "2026-01-05T10:00:00Z",
+                     "sender_device_id": "connector", "media_type": "image/png", "opened_at": None,
+                     "origin": {"agent": "connector", "conversation_id": "conversation-1"},
+                     "replies": [{"reply_id": CLAIM_REPLY, "created_at": "2026-01-05T10:05:00Z", "message": "Why 3?",
+                                  "image_url": f"/v1/agent-notes/replies/{CLAIM_REPLY}/image", "media_type": "image/png",
+                                  "stroke_count": 1}]}
+CLAIM_PAGE_RECORD = {"note_id": CLAIM_PAGE, "title": "Linear algebra · page 2", "message": "What next?",
+                     "created_at": "2026-01-05T10:06:00Z", "sender_device_id": "phone", "media_type": "image/png",
+                     "opened_at": None, "origin": {"kind": "phone_page", "page": 2}, "replies": []}
 PHOTO_NOTE_RECORD = {"note_id": PHOTO_NOTE, "title": "Sketch", "message": None, "created_at": "2026-11-11T13:51:58Z",
                      "sender_device_id": "connector", "media_type": "image/png", "opened_at": "2026-11-11T13:52:00Z",
                      "replies": [{"reply_id": "r2", "created_at": "2026-11-11T16:01:38Z",
@@ -221,8 +242,14 @@ class FakeThoughts(BaseHTTPRequestHandler):
                                     "next_device_sequence": len(PUBLISHED) + 1})
         if method == "POST" and path == "/v1/source-publications":
             body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
-            # The note first, then any figures thoughts-cli publishes with it (new sources).
-            mutation, *figures = body["mutations"]
+            # The note first, then any figures thoughts-cli publishes with it (new sources), or the other
+            # source of a card move (an existing one: both are published or neither).
+            mutation, *others = body["mutations"]
+            existing = [(other, next((s for s in SOURCES if s["path"] == other["path"]), None)) for other in others]
+            for other, known in existing:
+                if known is not None and (other["base_revision"], other["base_sha256"]) != (known["revision"], known["sha256"]):
+                    return self.reply(409, {"detail": f"source publication conflicts at {other['path']}; no source was published"})
+            figures = [other for other, known in existing if known is None]
             record = next((s for s in SOURCES if s["path"] == mutation["path"]), None)
             if record is None and (mutation["base_revision"], mutation["base_sha256"]) == (0, EMPTY):
                 # A new note (create_document).
@@ -231,11 +258,14 @@ class FakeThoughts(BaseHTTPRequestHandler):
             if record is None or (mutation["base_revision"], mutation["base_sha256"]) != (record["revision"], record["sha256"]):
                 return self.reply(409, {"detail": f"source publication conflicts at {mutation['path']}; no source was published"})
             PUBLISHED.append(body)
-            record.update(revision=record["revision"] + 1, sha256=mutation["content_sha256"],
-                          object_sha256=mutation["content_sha256"])
+            moved = []
+            for change, known in [(mutation, record)] + [(other, known) for other, known in existing if known is not None]:
+                known.update(revision=known["revision"] + 1, sha256=change["content_sha256"],
+                             object_sha256=change["content_sha256"])
+                moved.append({"outcome": "applied", "path": known["path"], "revision": known["revision"],
+                              "sha256": known["sha256"], "object_sha256": known["sha256"]})
             return self.reply(200, {"publication_id": body["publication_id"], "source_frontier": len(PUBLISHED) + 1,
-                                    "results": [{"outcome": "applied", "path": record["path"], "revision": record["revision"],
-                                                 "sha256": record["sha256"], "object_sha256": record["sha256"]}]
+                                    "results": moved
                                     + [{"outcome": "applied", "path": figure["path"], "revision": 1,
                                         "sha256": figure["content_sha256"], "object_sha256": figure["content_sha256"]}
                                        for figure in figures]})
@@ -390,10 +420,34 @@ class FakeThoughts(BaseHTTPRequestHandler):
             return self.reply(422, {"detail": "The source of the last successful PDF before this build is unavailable."})
         if method == "POST" and path == "/v1/render-checks":
             return self.reply(200, {"status": "building", "library_revision": 2, "build": {"id": "b1"}, "documents": []})
+        if method == "POST" and path.startswith("/v1/agent-notes/handling/") and path.endswith("/claim"):
+            body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+            CLAIMS.append((path, body))
+            outcome = CLAIM_OUTCOMES.get(path.split("/")[4], "yours")
+            if outcome == "yours":
+                return self.reply(201, {"claimed": True, "claim": {"device_id": "connector", "role": "sender",
+                                                                  "conversation_id": body.get("conversation_id")}})
+            if outcome == "responder":
+                return self.reply(409, {"claimed": False, "error_code": "agent_note_claimed", "detail": "taken",
+                                        "claim": {"device_id": "server", "conversation_id": "s", "role": "responder"}})
+            return self.reply(409, {"claimed": False, "error_code": "agent_note_not_covering", "detail": "no",
+                                    "claim": None})
+        if method == "GET" and path == "/v1/agent-notes/rules":
+            return self.reply(200, {"text": RULES_TEXT, "sha256": "r", "source_path": "docs-x/agent-note-rules.md",
+                                    "revision": 2, "updated_at": "2026-01-05T09:00:00Z", "others": []})
+        if method == "POST" and path == "/v1/agent-notes/owners":
+            body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+            OWNERS_POSTED.append(body)
+            return self.reply(201, {"owner_id": "b" * 24, **body, "live": True})
+        if method == "DELETE" and path.startswith("/v1/agent-notes/owners"):
+            DELETES.append((path, {key: values[0] for key, values in parse_qs(url.query).items()}))
+            return self.reply(204, b"")
         if method == "POST" and path == "/v1/agent-notes":
             body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
             POSTED.append(body)
-            return self.reply(201, {"note": {"note_id": body["note_id"]}, "delivery": {"live": True, "listeners": []},
+            # A server with links keeps them in the note record (always a list); one without ignores the field.
+            links = {"links": body.get("links") or []} if "agent_note_links_v1" in CAPABILITIES else {}
+            return self.reply(201, {"note": {"note_id": body["note_id"], **links}, "delivery": {"live": True, "listeners": []},
                                     **SEND_ANSWER})
         if method == "POST" and path.startswith("/v1/conflicts/"):
             body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
@@ -404,6 +458,8 @@ class FakeThoughts(BaseHTTPRequestHandler):
                   "/v1/conflicts": CONFLICTS,
                   "/v1/agent-notes": {"notes": [NOTE_RECORD, PHOTO_NOTE_RECORD]}, f"/v1/agent-notes/{NOTE}": NOTE_RECORD,
                   f"/v1/agent-notes/{PHOTO_NOTE}": PHOTO_NOTE_RECORD, "/v1/agent-notes/replies/r2/image": PNG,
+                  f"/v1/agent-notes/{CLAIM_NOTE}": CLAIM_NOTE_RECORD, f"/v1/agent-notes/{CLAIM_PAGE}": CLAIM_PAGE_RECORD,
+                  f"/v1/agent-notes/replies/{CLAIM_REPLY}/image": PNG,
                   "/v1/agent-notes/replies/r2/photo": JPEG,
                   "/v1/agent-notes/replies/r1/image": PNG, "/v1/agent-notes/replies": {"replies": [], "cursor": 0}}
         if path.startswith("/v1/objects/") and path.rsplit("/", 1)[1] in OBJECTS:
@@ -463,14 +519,21 @@ class FakeThoughts(BaseHTTPRequestHandler):
     def do_HEAD(self):
         self.handle_any("HEAD")
 
+    def do_DELETE(self):
+        self.handle_any("DELETE")
+
 
 @pytest.fixture(scope="module")
 def server():
     (TMP / "token").write_text(TOKEN + "\n")
     stub = TMP / "agent_notes_stub.py"
-    stub.write_text("import base64\nfrom types import SimpleNamespace\nRENDERED = []\n"
+    # The renderer's links: what MEASURED holds (written by measured_links), else none measured at all, as a
+    # renderer from before links.
+    stub.write_text("import base64, json\nfrom pathlib import Path\nfrom types import SimpleNamespace\nRENDERED = []\n"
                     "def render(*, markdown):\n    RENDERED.append(markdown)\n"
-                    f"    return SimpleNamespace(png=base64.b64decode({base64.b64encode(PNG).decode()!r}), warnings=[])\n")
+                    f"    measured = Path({str(MEASURED)!r})\n"
+                    "    extra = json.loads(measured.read_text()) if measured.exists() else {}\n"
+                    f"    return SimpleNamespace(png=base64.b64decode({base64.b64encode(PNG).decode()!r}), warnings=[], **extra)\n")
     thoughts_connector.AGENT_NOTES = stub
     fake = ThreadingHTTPServer(("127.0.0.1", THOUGHTS_PORT), FakeThoughts)
     threading.Thread(target=fake.serve_forever, daemon=True).start()
@@ -534,10 +597,11 @@ def test_tools_and_annotations(token):
     tools = {t["name"]: t for t in rpc(token, "tools/list")["tools"]}
     writers = {"send_note", "add_diary_entry", "create_proposals", "revise_proposal", "remove_proposal",
                "link_conversation", "create_document", "create_review_card", "move_review_card", "resolve_source_conflict",
-               "add_html_page", "move_pdf", "import_pdf", "merge_review_cards", "cancel_pending_card_move"}
+               "add_html_page", "move_pdf", "import_pdf", "merge_review_cards", "cancel_pending_card_move",
+               "own_topic", "release_topic"}
     assert set(tools) == {"list_documents", "read_document", "read_source", "search_library", "review_cards",
                           "get_review_card", "list_notes", "get_note", "document_feedback", "knowledge_profile", "source_conflicts",
-                          "read_source_conflict", "html_pages", "build_status", "pending_card_moves"} | writers
+                          "read_source_conflict", "html_pages", "build_status", "pending_card_moves", "note_rules"} | writers
     assert all(not tools[name]["annotations"]["readOnlyHint"] for name in writers)
     assert all(t["annotations"]["readOnlyHint"] for name, t in tools.items() if name not in writers)
     edit = tools["create_proposals"]["inputSchema"]
@@ -579,6 +643,8 @@ def test_documents_and_reading(token):
     docs = call(token, "list_documents")["structuredContent"]["documents"]
     assert [(d["project"], d["name"], d["kind"], d["published"]) for d in docs] == [
         ("ideas", "Ideas", "md", True), ("Research", "FindingsPaper", "tex", True), ("Research", "Hidden", "pdf", False)]
+    # The Library filename of each PDF, which links to it name.
+    assert [d["filename"] for d in docs] == ["ideas.pdf", None, "hidden.pdf"]
     text = call(token, "read_document", document_id="doc-rp")["structuredContent"]["text"]
     assert "Accuracy falls as noise grows." in text and "% ---- tex/fragments/results ----" in text  # \input inlined
     assert "ReviewCardMask" not in text  # markers removed
@@ -602,10 +668,10 @@ def test_document_feedback(token):
     assert data["feedback"] == [
         {"feedback_id": DISLIKED, "polarity": "negative", "quote": "passage 2", "comment": "Wrong sign.", "page": 3,
          "pdf_sha256": "a" * 64, "snapshot": "current", "created_at": "2026-10-28T10:30:00.000+02:00",
-         "updated_at": "2026-10-28T10:30:00.000+02:00", "origin": "android-cph2719"},
+         "updated_at": "2026-10-28T10:30:00.000+02:00", "origin": "android-example-phone"},
         {"feedback_id": LIKED, "polarity": "positive", "quote": "passage 1", "comment": "", "page": 1,
          "pdf_sha256": "f" * 64, "snapshot": "earlier", "created_at": "2026-10-28T08:52:03.512Z",
-         "updated_at": "2026-10-28T08:52:03.512Z", "origin": "android-cph2719"}]
+         "updated_at": "2026-10-28T08:52:03.512Z", "origin": "android-example-phone"}]
     text = listed["content"][0]["text"]
     assert "FindingsPaper: 1 liked, 1 disliked" in text
     assert "Disliked, p. 3 (current PDF), 2026-10-28: \u201cpassage 2\u201d \u2014 Wrong sign." in text
@@ -715,10 +781,167 @@ def test_send_note_says_when_nobody_listens_for_the_reply(token):
     finally:
         SEND_ANSWER.clear()
     assert sent["structuredContent"]["reply_listening"] == "not_listening"
-    assert "thoughts-watch-replies" in sent["content"][0]["text"]
+    assert sent["structuredContent"]["reply_agent_listening"] is False
+    assert "thoughts-watch-replies --conversation" in sent["content"][0]["text"]
+    assert "the phone tells the user nobody listens" in sent["content"][0]["text"]
     plain = call(token, "send_note", title="Grades", markdown="# Grades")  # a server that cannot tell
     assert plain["structuredContent"]["reply_listening"] == "unknown"
     assert "thoughts-watch-replies" not in plain["content"][0]["text"]
+
+
+def test_send_note_asks_for_the_watcher_even_when_the_reply_agent_listens(token):
+    SEND_ANSWER.update(reply_listening={"state": "listening", "listeners": [
+        {"device_id": "connector", "conversation_id": None, "note_id": None, "last_seen_at": "2026-01-05T10:00:00Z",
+         "responder": True, "role": "responder"}]})
+    try:
+        sent = call(token, "send_note", title="Grades", markdown="# Grades", conversation_id="conversation-1")
+        SEND_ANSWER.update(reply_listening={"state": "listening", "listeners": [
+            {"device_id": "connector", "conversation_id": "conversation-1", "note_id": None,
+             "last_seen_at": "2026-01-05T10:00:00Z", "responder": False, "role": "sender"}]})
+        heard = call(token, "send_note", title="Grades", markdown="# Grades", conversation_id="conversation-1")
+    finally:
+        SEND_ANSWER.clear()
+    assert sent["structuredContent"]["reply_agent_listening"] is True
+    assert "meanwhile the Thoughts reply agent covers it" in sent["content"][0]["text"]
+    assert POSTED[-2]["origin"] == {"agent": "connector", "conversation_id": "conversation-1"}
+    assert "thoughts-watch-replies" not in heard["content"][0]["text"]
+
+
+def test_get_note_claims_for_the_conversation_and_hands_over_the_rules(token):
+    CLAIMS.clear()
+    plain = call(token, "get_note", note_id=CLAIM_NOTE)  # no conversation: nothing is claimed
+    assert CLAIMS == [] and plain["structuredContent"]["replies"][0]["handling"] is None
+    got = call(token, "get_note", note_id=CLAIM_NOTE, conversation_id="conversation-1")
+    assert CLAIMS == [(f"/v1/agent-notes/handling/{CLAIM_REPLY}/claim",
+                       {"conversation_id": "conversation-1", "only_if_covering": True})]
+    text = got["content"][0]["text"]
+    assert "yours to answer" in text and "Answer in plain words." in text
+    assert got["structuredContent"]["replies"][0]["handling"]["state"] == "yours"
+
+    CLAIM_OUTCOMES[CLAIM_REPLY] = "responder"
+    try:
+        taken = call(token, "get_note", note_id=CLAIM_NOTE, conversation_id="conversation-1")
+    finally:
+        CLAIM_OUTCOMES.clear()
+    assert "the Thoughts reply agent answers it; do not answer it again" in taken["content"][0]["text"]
+    assert "Answer in plain words." not in taken["content"][0]["text"]
+
+    CLAIM_OUTCOMES[CLAIM_PAGE] = "not_covering"
+    try:
+        page = call(token, "get_note", note_id=CLAIM_PAGE, conversation_id="conversation-1")
+    finally:
+        CLAIM_OUTCOMES.clear()
+    assert CLAIMS[-1][0] == f"/v1/agent-notes/handling/{CLAIM_PAGE}/claim"
+    assert page["structuredContent"]["page_handling"]["state"] == "not_yours"
+    assert "This page: not yours" in page["content"][0]["text"]
+
+
+def test_note_rules_and_topic_owners(token):
+    rules = call(token, "note_rules")
+    assert rules["content"][0]["text"] == RULES_TEXT
+    assert rules["structuredContent"]["source_path"] == "docs-x/agent-note-rules.md"
+    OWNERS_POSTED.clear()
+    owned = call(token, "own_topic", conversation_id="conversation-1", label="Linear algebra",
+                 title_tags=["[Linear algebra]"], captures=True)
+    assert OWNERS_POSTED == [{"conversation_id": "conversation-1", "label": "Linear algebra", "document_ids": [],
+                              "review_card_ids": [], "title_tags": ["[Linear algebra]"], "captures": True}]
+    assert "thoughts-watch-replies --conversation conversation-1" in owned["content"][0]["text"]
+    DELETES.clear()
+    call(token, "release_topic", owner_id="b" * 24)
+    call(token, "release_topic", conversation_id="conversation-1")
+    assert DELETES == [("/v1/agent-notes/owners/" + "b" * 24, {}),
+                       ("/v1/agent-notes/owners", {"conversation_id": "conversation-1"})]
+
+
+class measured_links:
+    """While in use, the stub renderer measures these links ([href, [x, y, width, height] in CSS px, text])."""
+
+    def __init__(self, links, css_height=400):
+        self.value = {"links": links, "css_height": css_height}
+
+    def __enter__(self):
+        MEASURED.write_text(json.dumps(self.value))
+
+    def __exit__(self, *exc):
+        MEASURED.unlink(missing_ok=True)
+
+
+def test_note_links_open_web_pages_and_library_pdfs(token):
+    links = [["https://example.org/paper", [120, 40, 72, 20], "the paper"],
+             # A link wrapped over two lines, to a Library PDF behind its folder: page 53 as printed is page 52.
+             ["../../docs-ideas/ideas.pdf#page=53", [432, 80, 48, 20], "a long link"],
+             ["../../docs-ideas/ideas.pdf#page=53", [24, 100, 96, 20], "a long link"],
+             ["#page=2", [192, 200, 48, 48], ""],                  # an <a> in an SVG, a page of the note's own document
+             ["HIDDEN.PDF#page=1", [24, 260, 48, 20], "hidden"],   # the Library's own spelling, unpublished or not
+             ["Missing_example.pdf#page=3", [24, 300, 48, 20], "p. 3"],
+             ["mailto:alex@example.org", [24, 320, 48, 20], "write"],
+             ["https://example.org/below", [24, 390, 48, 20], "below"],   # half cut off by the page's height
+             ["https://example.org/gone", [24, 420, 48, 20], "gone"]]     # entirely below it
+    with measured_links(links):
+        sent = call(token, "send_note", title="Sources", markdown="# Sources", document_id="doc-ideas")
+    assert POSTED[-1]["links"] == [
+        {"rect": [0.25, 0.1, 0.15, 0.05], "href": "https://example.org/paper", "label": "the paper"},
+        {"rect": [0.9, 0.2, 0.1, 0.05], "href": "thoughts-pdf-link:ideas.pdf?page=52", "label": "a long link"},
+        {"rect": [0.05, 0.25, 0.2, 0.05], "href": "thoughts-pdf-link:ideas.pdf?page=52", "label": "a long link"},
+        {"rect": [0.4, 0.5, 0.1, 0.12], "href": "thoughts-pdf-link:ideas.pdf?page=1"},
+        {"rect": [0.05, 0.65, 0.1, 0.05], "href": "thoughts-pdf-link:hidden.pdf?page=0", "label": "hidden"},
+        {"rect": [0.05, 0.75, 0.1, 0.05], "href": "thoughts-pdf-link:Missing_example.pdf?page=2", "label": "p. 3"},
+        {"rect": [0.05, 0.975, 0.1, 0.025], "href": "https://example.org/below", "label": "below"}]
+    body = sent["structuredContent"]
+    assert [link["href"] for link in body["links"]] == [link["href"] for link in POSTED[-1]["links"]]
+    assert len(body["warnings"]) == 2  # one per doubtful or dropped link, not per rectangle
+    assert "no Library PDF is named Missing_example.pdf" in body["warnings"][0]
+    assert "mailto:alex@example.org is neither a web address" in body["warnings"][1]
+    assert "with 7 tappable links" in sent["content"][0]["text"]
+
+
+def test_note_links_wait_for_the_server_capability(server, token):
+    CAPABILITIES.remove("agent_note_links_v1")
+    server.thoughts.cached.pop("health", None)
+    try:
+        with measured_links([["https://example.org/", [24, 40, 48, 20], "a page"]]):
+            sent = call(token, "send_note", title="Older server", markdown="[a page](https://example.org/)")
+    finally:
+        CAPABILITIES.append("agent_note_links_v1")
+        server.thoughts.cached.pop("health", None)
+    assert "links" not in POSTED[-1]
+    body = sent["structuredContent"]
+    assert body["links"] == [] and "does not support links yet (agent_note_links_v1)" in body["warnings"][0]
+    assert "tappable" not in sent["content"][0]["text"]
+
+
+def test_a_note_without_links_asks_for_nothing_more(token):
+    """No links measured (or a renderer from before links): neither the catalogue nor the capabilities are read."""
+    before = len(REQUESTS)
+    with measured_links([]):
+        call(token, "send_note", title="Plain", markdown="# Plain")
+    sent = call(token, "send_note", title="Plain", markdown="# Plain")
+    assert "links" not in POSTED[-1] and sent["structuredContent"]["links"] == []
+    assert [path for _method, path, _auth in REQUESTS[before:]] == ["/v1/agent-notes", "/v1/agent-notes"]
+
+
+def test_note_link_targets_are_what_the_server_takes():
+    library = {"primer_example.pdf": "Primer_example.pdf"}
+    target = lambda href, own=None, known=library: thoughts_connector.note_link_target(href, own, known)
+    assert target("https://example.org/a?b=1#c") == ("https://example.org/a?b=1#c", None)
+    assert target("https://example.org/" + "x" * 2100)[0] is None
+    assert target("primer_EXAMPLE.pdf") == ("thoughts-pdf-link:Primer_example.pdf?page=0", None)
+    assert target("Primer_example.pdf#page=0") == ("thoughts-pdf-link:Primer_example.pdf?page=0", None)
+    assert target("thoughts-pdf-link:Primer_example.pdf?page=4&x=10.5&y=-3") == (
+        "thoughts-pdf-link:Primer_example.pdf?page=4&x=10.5&y=-3", None)
+    assert target("thoughts-pdf-link:Primer_example.pdf?page=x")[0] is None
+    assert target("#page=7", own="Own_example.pdf", known=None) == ("thoughts-pdf-link:Own_example.pdf?page=6", None)
+    assert "give document_id" in target("#page=7")[1] and target("#page=7")[0] is None
+    # Not in the Library: kept for a page the phone may have, unless the server would refuse the whole note for it.
+    assert target("Other_example.pdf#page=2")[0] == "thoughts-pdf-link:Other_example.pdf?page=1"
+    assert target("Other_example.PDF#page=2")[0] is None
+    assert target("Other_example.pdf#page=2", known=None) == ("thoughts-pdf-link:Other_example.pdf?page=1", None)
+    for dropped in ("javascript:alert(1)", "file:///etc/hosts", "notes.md#intro", "", "ftp://example.org/x.pdf"):
+        assert target(dropped)[0] is None, dropped
+    many = [[f"https://example.org/{n}", [0, n, 10, 1], ""] for n in range(70)]
+    links, warnings = thoughts_connector.note_links(many, 100)
+    assert len(links) == 64 and "only the first 64" in warnings[0]
+    assert links[0] == {"rect": [0.0, 0.0, 0.020833, 0.01], "href": "https://example.org/0"}
 
 
 @pytest.mark.skipif(not HAVE_CLI, reason="thoughts-cli not found (set THOUGHTS_CLI)")
@@ -899,7 +1122,7 @@ def test_create_review_card_marks_the_passage_in_one_operation(token):
     source = call(token, "read_source", source="docs-ideas/markdown/source/ideas.md")["structuredContent"]
     request_id = "c5b6c5b7-1d2a-4c3b-9f8e-112233445566"
     arguments = dict(source=source["source"], expected_source_sha256=source["source_sha256"], start_line=3, end_line=4,
-                     question="What limits observability?", due_at="2099-01-01T09:00:00+01:00", request_id=request_id)
+                     question="What is the note about?", due_at="2099-01-01T09:00:00+01:00", request_id=request_id)
     created = call(token, "create_review_card", **arguments)
     (operation,) = OPERATIONS
     payload = operation["payload"]
@@ -1033,7 +1256,7 @@ def pending_note(server):
     card = {"entity_type": "review_card", "entity_id": PENDING_CARD, "deleted": False, "revision": 1, "payload": {
         "card_id": PENDING_CARD, "status": "approved", "revision": 1, "created_at": "2026-11-01T00:00:00Z",
         "primary": {"document_id": "paper", "pdf_stem": "Paper_p3", "page": 2, "rect": [0.1, 0.1, 0.4, 0.2],
-                    "question": "What does FlashAttention avoid?"}}}
+                    "question": "What does the second technique avoid?"}}}
     PROJECTIONS["projections"].append(card)
     for key in ("sources", "projections", "health"):
         server.thoughts.cached.pop(key, None)
@@ -1377,3 +1600,131 @@ def test_feedback_in_an_html_page_names_the_page_instead_of_a_page_number():
     summary = thoughts_connector.feedback_summary(on_pdf, "a" * 64)
     assert "html_attachment" not in summary
     assert thoughts_connector.feedback_line(summary) == "- Disliked, p. 3 (current PDF), 2026-11-04: “The item is easy”"
+
+
+PASSAGE_CLI = HAVE_CLI and (CLI / "thoughts_cli" / "card_passage_moves.py").is_file()
+LINKED_CARD = "77777777-7777-4777-8777-777777777777"
+LINKED_FROM, LINKED_TO = "docs-ideas/markdown/source/linked.md", "docs-rp/markdown/source/target.md"
+LINKED_KEY = f"review:{LINKED_CARD}:answer:0"
+LINKED_PASSAGE = (f"<!-- thoughts:v1:start {LINKED_KEY} -->\nThe second technique avoids the quadratic memory.\n"
+                  f"<!-- thoughts:v1:end {LINKED_KEY} -->\n")
+LINKED_NOTE = "# Linked\n\n" + LINKED_PASSAGE + "\nAfter.\n"
+TARGET_NOTE = "# Target\n\nFirst.\n\nSecond.\n"
+MOVE_CONVERSATION = "0b6c5b7e-1d2a-4c3b-9f8e-112233445566"
+
+
+@pytest.fixture
+def linked_note(server):
+    """Two Markdown notes of different folders and an approved card linked to markers in the first."""
+    records = []
+    for path, text in ((LINKED_FROM, LINKED_NOTE), (LINKED_TO, TARGET_NOTE)):
+        digest, data = obj(text)
+        OBJECTS[digest] = data
+        records.append({"path": path, "revision": 1, "sha256": digest, "object_sha256": digest, "deleted": False})
+    SOURCES.extend(records)
+    card = {"entity_type": "review_card", "entity_id": LINKED_CARD, "deleted": False, "revision": 1, "payload": {
+        "card_id": LINKED_CARD, "status": "approved", "revision": 1, "created_at": "2026-11-01T00:00:00Z",
+        "primary": {"document_id": "doc-ideas", "pdf_stem": "ideas", "question": "What does the second technique avoid?",
+                    "source_anchor": {"version": 2, "segments": [{"segment_id": "0", "source_file": LINKED_FROM}]}}}}
+    PROJECTIONS["projections"].append(card)
+    for key in ("sources", "projections", "health"):
+        server.thoughts.cached.pop(key, None)
+    try:
+        yield records[1]["sha256"]
+    finally:
+        for record in records:
+            SOURCES.remove(record)
+        PROJECTIONS["projections"].remove(card)
+        for key in ("sources", "projections", "health"):
+            server.thoughts.cached.pop(key, None)
+
+
+def source_text(path: str) -> str:
+    return OBJECTS[next(s for s in SOURCES if s["path"] == path)["sha256"]].decode()
+
+
+@pytest.mark.skipif(not PASSAGE_CLI, reason="thoughts-cli with move-card-passage not found")
+def test_move_review_card_moves_a_linked_card_as_one_decision(token, linked_note):
+    """A card linked to source markers: start_line == end_line proposes the cut and the paste together."""
+    arguments = dict(card_id=LINKED_CARD, source=LINKED_TO, expected_source_sha256=linked_note, start_line=5, end_line=5,
+                     request_id="a5b6c5b7-1d2a-4c3b-9f8e-112233445566", explanation="Merge the notes.",
+                     conversation_id=MOVE_CONVERSATION)
+    before, operations = len(PUBLISHED), len(OPERATIONS)
+    moved = call(token, "move_review_card", **arguments)
+    body = moved["structuredContent"]
+    assert (body["state"], body["card_id"], body["source"], body["origin_source"]) == (
+        "move_proposed", LINKED_CARD, LINKED_TO, LINKED_FROM)
+    cut, paste = body["proposals"]
+    base = cut["proposal_id"].removesuffix(".cut")
+    assert re.fullmatch(r"agent-[0-9a-f-]{36}", base) and paste["proposal_id"] == base + ".paste"
+    assert (cut["original_text"], cut["replacement"], paste["original_text"], paste["replacement"]) == (
+        LINKED_PASSAGE, "", "", LINKED_PASSAGE)
+    # One publication carries both sources; no card operation: the card follows its markers once accepted.
+    assert len(PUBLISHED) == before + 1 and len(OPERATIONS) == operations
+    assert [m["path"] for m in PUBLISHED[-1]["mutations"]] == [LINKED_FROM, LINKED_TO]
+    assert "proposal_decisions" not in PUBLISHED[-1]
+    assert f"id: {base}.cut\n" in source_text(LINKED_FROM) and LINKED_PASSAGE not in source_text(LINKED_FROM)
+    assert source_text(LINKED_TO).endswith(LINKED_PASSAGE + f"<!-- thoughts:agent-proposal:v2:end {base}.paste -->\nSecond.\n")
+    text = moved["content"][0]["text"]
+    assert f"Proposed moving card {LINKED_CARD} with its marked passage from {LINKED_FROM} to {LINKED_TO}" in text
+    assert "deciding either proposal decides both" in text and f"{base}.paste at line 5 of {LINKED_TO}" in text
+    replay = call(token, "move_review_card", **arguments)
+    assert replay["structuredContent"]["replayed"] is True and len(PUBLISHED) == before + 1
+    # A half cannot be revised; withdrawing either half withdraws both, in both sources.
+    digest = current_sha256(token, LINKED_TO)
+    revised = rpc(token, "tools/call", {"name": "revise_proposal", "arguments": dict(
+        source=LINKED_TO, expected_source_sha256=digest, proposal_id=base + ".paste", replacement="Other.\n",
+        explanation="Change.", conversation_id=MOVE_CONVERSATION, request_id="a6b6c5b7-1d2a-4c3b-9f8e-112233445566")})
+    assert revised["isError"] and revised["structuredContent"]["error_code"] == "move_proposal"
+    withdrawn = call(token, "remove_proposal", source=LINKED_TO, expected_source_sha256=digest,
+                     proposal_id=base + ".paste", explanation="Not there.", conversation_id=MOVE_CONVERSATION,
+                     request_id="a7b6c5b7-1d2a-4c3b-9f8e-112233445566")
+    assert withdrawn["structuredContent"]["withdrawn_proposal_ids"] == [base + ".paste", base + ".cut"]
+    assert f"the other half ({base}.cut in {LINKED_FROM}" in withdrawn["content"][0]["text"]
+    assert (source_text(LINKED_FROM), source_text(LINKED_TO)) == (LINKED_NOTE, TARGET_NOTE)
+    assert [(c["proposal_id"], c["action"], c["source_file"]) for c in PUBLISHED[-1]["proposal_decisions"]] == [
+        (base + ".paste", "withdraw", LINKED_TO), (base + ".cut", "withdraw", LINKED_FROM)]
+
+
+@pytest.mark.skipif(not PASSAGE_CLI, reason="thoughts-cli with move-card-passage not found")
+def test_a_linked_card_move_needs_its_reason_the_server_and_the_cli(server, token, linked_note, monkeypatch):
+    arguments = dict(card_id=LINKED_CARD, source=LINKED_TO, expected_source_sha256=linked_note, start_line=5, end_line=5,
+                     request_id="a8b6c5b7-1d2a-4c3b-9f8e-112233445566")
+    before = len(PUBLISHED)
+
+    def refused(code, **extra):
+        answer = rpc(token, "tools/call", {"name": "move_review_card", "arguments": {**arguments, **extra}})
+        assert answer["isError"] and answer["structuredContent"]["error_code"] == code, answer
+        assert len(PUBLISHED) == before
+        return answer["content"][0]["text"]
+
+    reason = dict(explanation="Merge the notes.", conversation_id=MOVE_CONVERSATION)
+    assert "needs explanation and conversation_id" in refused("invalid_request")
+    # With a line range the card is told how to move, not sent to the user.
+    ranged = refused("linked_card", source=IDEAS_PATH, expected_source_sha256=current_sha256(token, IDEAS_PATH),
+                     start_line=3, end_line=4)
+    assert "start_line equal to end_line" in ranged and "cutting" not in ranged
+    # A line past the end of the destination.
+    refused("invalid_range", start_line=9, end_line=9, **reason)
+    CAPABILITIES.remove("review_card_move_pairs_v1")
+    server.thoughts.cached.pop("health", None)
+    try:
+        assert "review_card_move_pairs_v1" in refused("server_unsupported", **reason)
+    finally:
+        CAPABILITIES.append("review_card_move_pairs_v1")
+        server.thoughts.cached.pop("health", None)
+    from types import SimpleNamespace
+
+    old_cli = SimpleNamespace(client=SimpleNamespace(COMMANDS=("create-review-card", "move-review-card")))
+    monkeypatch.setattr(thoughts_connector, "load_thoughts_cli", lambda: old_cli)
+    assert "thoughts-cli 1.7.0" in refused("not_supported", **reason)
+
+
+def test_move_review_card_tells_agents_to_move_linked_cards_themselves(token):
+    tools = {tool["name"]: tool for tool in rpc(token, "tools/list")["tools"]}
+    description = tools["move_review_card"]["description"]
+    assert "start_line equal to end_line" in description and "decides both" in description
+    assert "the user moves\n        it in Thoughts by cutting" not in description
+    assert "never ask the user to cut and paste it by hand" in " ".join(description.split())
+    assert {"explanation", "conversation_id"} <= set(tools["move_review_card"]["inputSchema"]["properties"])
+    assert not {"explanation", "conversation_id"} & set(tools["move_review_card"]["inputSchema"].get("required", []))

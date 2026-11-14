@@ -11,10 +11,16 @@ desktop version (Client.replies with listen).
 
 It tells the server that an agent listens (protocol "Who hears a reply"), so while it runs the phone shows
 the user that their reply will be heard; once it stops, the phone warns that nobody is listening.
-Connector notes name no conversation, so it listens for every note the connector sent.
+Without --conversation it listens for every note the connector sent. With --conversation ID (the id the session
+passes to send_note and get_note) it listens for that conversation's notes and the topics it owns (own_topic): its
+polls keep those ownerships alive, and it prints a PAGE line for each page the user sends on them (the Thoughts reply
+agent answers the other pages). It starts by printing the user's answering rules (RULES| lines), which every agent
+follows when it answers a reply or a page, when the server serves them (agent_note_rules_v1).
 """
+import argparse
 import os
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -27,10 +33,65 @@ sys.path.insert(0, str(Path(os.environ["THOUGHTS_AGENT_NOTES"]).parent if os.env
 import agent_notes as a  # noqa: E402
 
 
-def newest_cursor(client) -> int:
+lock = threading.Lock()
+
+
+def say(line: str) -> None:
+    with lock:
+        print(line, flush=True)
+
+
+def get(client, path: str, query: dict | None = None, wait: float = 0):
+    """A GET through the agent_notes client (its request() exists in every version); None when refused."""
+    try:
+        return client.request("GET", path, query=query, read_timeout=wait + 20)
+    except a.AgentNoteError:
+        return None
+
+
+def capabilities(client) -> set:
+    answer = get(client, "/v1/health") or {}
+    return set(answer.get("capabilities") or []) if isinstance(answer, dict) else set()
+
+
+def say_rules(client, found: set) -> None:
+    if "agent_note_rules_v1" not in found:
+        return
+    rules = get(client, "/v1/agent-notes/rules")
+    if not isinstance(rules, dict) or not rules.get("text"):
+        say("RULES none yet: the Library has no note named agent-note-rules.md")
+        return
+    say(f"RULES the user's answering rules ({rules.get('source_path')}); follow them when you answer a reply or page:")
+    for line in rules["text"].rstrip().split("\n"):
+        say("RULES| " + line)
+
+
+def owned_pages(client, conversation_id: str) -> None:
+    """PAGE lines for the pages of the topics this conversation owns."""
+    after = None
+    while True:
+        try:
+            if after is None:
+                after = (get(client, "/v1/agent-notes/pages") or {}).get("cursor")
+                if after is None:
+                    raise RuntimeError("the pages feed is unavailable")
+            query = {"after": after, "wait": 50, "conversation_id": conversation_id}
+            result = get(client, "/v1/agent-notes/pages", query, wait=50) or {}
+            for note in result.get("notes") or []:
+                after = max(after, note.get("sequence", 0))
+                origin = note.get("origin") or {}
+                say(f"PAGE note={note.get('note_id')} title={note.get('title')!r} page={origin.get('page')} "
+                    f"strokes={origin.get('stroke_count')} message={note.get('message')!r}")
+            after = max(after, result.get("cursor") or after)
+        except Exception as error:
+            say(f"ERROR pages {type(error).__name__}: {error}")
+            time.sleep(15)
+
+
+def newest_cursor(client, conversation_id: str | None = None) -> int:
     """The feed answers oldest first, 50 at a time: page to the newest reply."""
     if hasattr(a, "feed_cursor"):
-        return a.feed_cursor(client)
+        return a.feed_cursor(client, conversation_id) if conversation_id else a.feed_cursor(client)
     cursor = 0
     while True:
         page = client.replies(after=cursor, wait=0)
@@ -49,27 +110,40 @@ def line(reply) -> str:
 
 
 def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser.add_argument("--conversation", help="listen for this conversation's notes and the topics it owns")
+    parser.add_argument("--check", action="store_true", help="print the newest reply's cursor and stop")
+    args = parser.parse_args()
+    conversation = (args.conversation or "").strip() or None
     client = a.default_client()
-    if "--check" in sys.argv:
-        print("ok cursor", newest_cursor(client), flush=True)
+    if args.check:
+        print("ok cursor", newest_cursor(client, conversation), flush=True)
         return
     after = None
     while after is None:
         try:
-            after = newest_cursor(client)
+            after = newest_cursor(client, conversation)
         except Exception as error:
-            print(f"ERROR {type(error).__name__}: {error}", flush=True)
+            say(f"ERROR {type(error).__name__}: {error}")
             time.sleep(15)
-    print("LISTENING for replies to every note the connector sent", flush=True)
+    say(f"LISTENING for replies to the notes of conversation {conversation} and the topics it owns" if conversation
+        else "LISTENING for replies to every note the connector sent")
+    found = capabilities(client)
+    say_rules(client, found)
+    if conversation and "agent_note_owners_v1" in found:
+        threading.Thread(target=owned_pages, args=(client, conversation), daemon=True).start()
     while True:
         try:
-            result = client.replies(after=after, wait=50, listen=True)
+            if conversation:
+                result = client.replies(after=after, wait=50, listen=True, conversation_id=conversation)
+            else:
+                result = client.replies(after=after, wait=50, listen=True)
             for reply in result.get("replies", []):
                 after = max(after, reply.get("sequence", 0))
-                print(line(reply), flush=True)
+                say(line(reply))
             after = max(after, result.get("cursor") or after)
         except Exception as error:
-            print(f"ERROR {type(error).__name__}: {error}", flush=True)
+            say(f"ERROR {type(error).__name__}: {error}")
             time.sleep(15)
 
 
