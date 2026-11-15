@@ -90,6 +90,25 @@ SERVICE = core.Service(
 CACHE_TTL = 30.0
 PAUSE_AFTER_401 = 600.0
 UUID = r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"
+
+# What the user lets the agent answering a reply use, chosen with each reply on the Mac or the phone
+# (server agent_note_reply_sources_v1). A reply without it (older apps) allows everything, as before.
+REPLY_SOURCES = {
+    "none": "Use no Thoughts documents at all: do not search or read the Library, the knowledge profile (review cards) "
+            "or the Mental Model, and give no Library links. Answer from the note, the reply and general knowledge.",
+    "linked_pdf": "Use only the PDF this note is linked to (its document_id): read and cite that document alone, with page "
+                  "links into it. No other Library document, no knowledge profile, no Mental Model. When the note has no "
+                  "linked document, use no Thoughts documents.",
+    "library": "Use any Library document (search, read, cite with page links) and the knowledge profile, but not the Mental Model.",
+    "library_and_mental_model": "Use the Library, the knowledge profile and the Mental Model, as the answering rules say.",
+}
+DEFAULT_REPLY_SOURCES = "library_and_mental_model"
+
+
+def reply_sources(value) -> tuple[str, str]:
+    """The reply's sources choice (the default when absent or unknown) and the rule it sets for the answer."""
+    chosen = value if value in REPLY_SOURCES else DEFAULT_REPLY_SOURCES
+    return chosen, REPLY_SOURCES[chosen]
 ALLOWED = [(method, re.compile(f"^{pattern}$")) for method, pattern in (
     ("GET", r"/v1/library/projects"),
     ("GET", r"/v1/sources"),
@@ -1301,8 +1320,11 @@ def create_app(service: core.Service = SERVICE, thoughts_url: str = THOUGHTS_URL
         replies = []
         for reply in note.get("replies") or []:
             photo = reply.get("photo") if isinstance(reply.get("photo"), dict) else None
+            sources, sources_rule = reply_sources(reply.get("sources"))
             replies.append({**{k: reply.get(k) for k in ("reply_id", "created_at", "message", "stroke_count")},
-                            "photo_capture": photo.get("capture") if photo else None, "has_photo": photo is not None})
+                            "photo_capture": photo.get("capture") if photo else None, "has_photo": photo is not None,
+                            # What the user lets the answer use (server agent_note_reply_sources_v1).
+                            "sources": sources, "sources_rule": sources_rule})
             if reply.get("image_url"):
                 data = (await thoughts.request("GET", f"/v1/agent-notes/replies/{reply['reply_id']}/image")).content
                 images.append(ImageContent(type="image", data=base64.b64encode(data).decode(), mimeType=reply.get("media_type") or "image/png"))
@@ -1322,6 +1344,7 @@ def create_app(service: core.Service = SERVICE, thoughts_url: str = THOUGHTS_URL
                 + "".join(f"\n- {r['created_at'][:16]}" + (f": {r['message']}" if r.get("message") else "")
                           + (f" [with a photo from the glasses: {r['photo_capture'] or 'attached'}; act on the words with it]"
                              if r["has_photo"] else "")
+                          + (f" [Sources the user allows: {r['sources_rule']}]" if r["sources"] != DEFAULT_REPLY_SOURCES else "")
                           + (f" ({handling_words(r['handling'])})" if r.get("handling") else "") for r in replies)
                 + (f"\nThis page: {handling_words(handling[note_id])}." if page and handling.get(note_id) else ""))
         if any((value or {}).get("state") == "yours" for value in handling.values()):

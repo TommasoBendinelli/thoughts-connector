@@ -202,6 +202,7 @@ PHOTO_NOTE_RECORD = {"note_id": PHOTO_NOTE, "title": "Sketch", "message": None, 
                      "replies": [{"reply_id": "r2", "created_at": "2026-11-11T16:01:38Z",
                                   "message": "Redraw it from this picture",
                                   "image_url": "/v1/agent-notes/replies/r2/image", "media_type": "image/png", "stroke_count": 0,
+                                  "sources": "linked_pdf",
                                   "photo": {"url": "/v1/agent-notes/replies/r2/photo", "media_type": "image/jpeg",
                                             "capture": "IMG_20261111_170138_123_ab12"}}]}
 
@@ -741,6 +742,9 @@ def test_notes(token):
     assert len(images) == 1 and base64.b64decode(images[0]["data"]) == PNG  # the user's drawing, visible to the model
     assert note["structuredContent"]["replies"][0]["message"] == "like this?"
     assert note["structuredContent"]["replies"][0]["has_photo"] is False
+    # A reply that does not say what the answer may use allows everything, as before.
+    assert note["structuredContent"]["replies"][0]["sources"] == "library_and_mental_model"
+    assert "Sources the user allows" not in note["content"][0]["text"]
 
 
 def test_a_reply_photo_reaches_the_agent_and_the_watcher_sees_its_capture(token):
@@ -758,6 +762,10 @@ def test_a_reply_photo_reaches_the_agent_and_the_watcher_sees_its_capture(token)
     reply = note["structuredContent"]["replies"][0]
     assert (reply["has_photo"], reply["photo_capture"]) == (True, "IMG_20261111_170138_123_ab12")
     assert "with a photo from the glasses: IMG_20261111_170138_123_ab12" in note["content"][0]["text"]
+    # The user narrowed what the answer may use: the agent is told, in the record and the text.
+    assert reply["sources"] == "linked_pdf"
+    assert "only the PDF this note is linked to" in reply["sources_rule"]
+    assert "Sources the user allows: Use only the PDF this note is linked to" in note["content"][0]["text"]
 
 
 def test_waiting_for_a_reply_tells_the_phone_an_agent_listens(token):
