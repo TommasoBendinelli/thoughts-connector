@@ -2,7 +2,8 @@
 """knowledge_profile against a fake Thoughts server, through the connector's own Thoughts wrapper.
 
 The cases are those of the Mac's autotests/reviewknowledgetest.cpp (thoughts-desktop) for
-knowledge-profile, on the same Library: two projects, a TeX and a Markdown source with card
+knowledge-profile (profileClassifiesByTagsRecencyAndInterval, profileDescribesTheLearnerForNewTopics and
+the others), with the same expected strings, on the same Library: two projects, a TeX and a Markdown source with card
 markers, cards, answers, a tag merge and the tag groups, served as /v1/projections,
 /v1/library/projects, /v1/sources and /v1/objects records. Plus what is particular to the server:
 only GET requests to the routes the connector may use, a mapping passed in, and deletions the
@@ -224,10 +225,11 @@ def test_profile_classifies_by_tags_recency_and_interval(server):
     assert result["mapping"]["source"] == "given mapping"
     assert result["mapping"]["levels"]["Correct"] == "solid" and result["mapping"]["levels"]["Wrong"] == "unknown"
     assert result["mapping"]["unmapped_understanding_tags"] == ["Totally new tag"]
-    # Each card: its question, document (the Library name of its PDF), project and reason.
+    # Each card: its question, document (the Library name of its PDF), project, reason, and the signals
+    # of its last answer that has any (GRPO's first answer: "interesting" of the Interest group).
     grpo = next(c for c in result["cards"]["solid"] if c["card_id"] == GRPO)
     assert grpo == {"card_id": GRPO, "question": "How does GRPO compute the group-relative advantage?",
-                    "document": "GRPO notes", "project": "RL", "reason": grpo["reason"]}
+                    "document": "GRPO notes", "project": "RL", "reason": grpo["reason"], "signals": {"Interest": "interesting"}}
 
     # Wrong now after Correct long ago: not understood.
     tensor = server.profile(topic="tensor parallelism", levels=LEGACY)
@@ -242,7 +244,139 @@ def test_profile_classifies_by_tags_recency_and_interval(server):
     nothing = server.profile(topic="diffusion", levels=LEGACY)
     assert nothing["accepted"] and nothing["matched"] == 0
     assert nothing["counts"] == {"solid": 0, "shaky": 0, "unknown": 0, "unreviewed": 0}
-    assert nothing["summary"] == 'No review cards match "diffusion": there is no record of what the user knows about it.'
+    assert nothing["summary"].split("\n")[0] == 'No review cards match "diffusion": there is no record of what the user knows about it.'
+
+
+def learner_layout(library):
+    """The Mac test's layout for profileDescribesTheLearnerForNewTopics, with its answers."""
+    # Interest as a slider and Effort as chips, as in the 2026-10-15 layout.
+    library.groups = {"layout_id": "groups", "schema_version": 1, "updated_at": "2026-10-01T00:00:00.000Z", "origin_id": "test",
+                      "groups": [{"group_id": "g-understanding", "name": "Understanding",
+                                  "tags": ["correct", "wrong", "Memorized", "Kind of memorized", "I kind of get it"]},
+                                 {"group_id": "g-interest", "name": "Interest",
+                                  "scale": ["Not interesting", "Somewhat", "Interesting", "Very interesting"]},
+                                 {"group_id": "g-effort", "name": "Effort", "tags": ["Skimmed", "Studied"]},
+                                 {"group_id": "g-confidence", "name": "Confidence", "phase": "before",
+                                  "scale": ["Guessing", "Not sure", "Fairly sure", "Sure"]},
+                                 # Asked before the answer, about the review itself: not a signal about the card.
+                                 {"group_id": "g-feeling", "name": "Feeling", "phase": "before", "scale": ["Tired", "OK", "Fresh"]}]}
+    # KL: very interesting and studied; tensor parallelism: not interesting, skimmed.
+    library.add_event(answer("e6", KL, 4, 7, ["I kind of get it", "very interesting", "Studied", "Sure", "Tired"]))
+    library.add_event(answer("e4", TENSOR, 1, 0.9, ["wrong", "Not interesting", "Skimmed", "Guessing"]))
+
+
+def test_profile_describes_the_learner_for_new_topics(server, library, tmp_path):
+    learner_layout(library)
+    # Matching cards carry what their last answer said besides how well it is known.
+    topic = server.profile(topic="RL", levels=LEGACY)
+    assert topic["accepted"], topic
+    shaky = topic["cards"]["shaky"][0]
+    assert shaky["signals"] == {"Interest": "Very interesting", "Effort": "Studied", "Confidence": "Sure"}
+    assert "Interest: typically Very interesting (Interesting 1, Very interesting 1)" in topic["summary"], topic["summary"]
+    assert "Feeling" not in topic["summary"], topic["summary"]
+    # Sure of a shaky answer is overconfident; guessing at one not understood is about right.
+    assert topic["calibration"]["overconfident"] == ["Why add a KL penalty to the reward?"]
+    assert "Overconfident on: Why add a KL penalty to the reward?" in topic["summary"], topic["summary"]
+    # Enough cards match: no general picture unless asked for.
+    assert "learner" not in topic
+    assert "learner" in server.profile(topic="RL", learner=True, levels=LEGACY)
+    assert server.profile(topic="RL", learner="yes", levels=LEGACY)["error_code"] == "invalid_request"
+
+    # Nothing matches a new topic: what all the cards say about the user takes its place.
+    fresh = server.profile(topic="diffusion", levels=LEGACY)
+    summary = fresh["summary"].split("\n")
+    assert len(summary) > 6, "\n".join(summary)
+    assert summary[1] == "Use what the cards say about the user in general instead:"
+    assert summary[2] == "In general (all 5 review cards): 2 solid, 1 shaky, 1 not understood, 1 not yet reviewed."
+    assert summary[3].startswith("Studied: ")
+    assert "Interest: typically Interesting (Interesting 1, Not interesting 1, Very interesting 1)" in summary, "\n".join(summary)
+    assert "Effort: typically Skimmed (Skimmed 1, Studied 1)" in summary
+    assert "Struggles with: What does tensor parallelism split?; Why add a KL penalty to the reward?" in summary
+    learner = fresh["learner"]
+    assert learner["cards"] == 5
+    assert len(learner["documents"]) == 3
+    assert learner["signals"]["Interest"]["typical"] == "Interesting"
+    assert len(learner["knows_well"]) == 2
+    assert learner["calibration"] == {"cards": 2, "calibrated": 1, "overconfident": ["Why add a KL penalty to the reward?"],
+                                      "underconfident": []}
+    assert "Calibration (confidence before seeing the answer vs. the answer, 2 cards): 1 overconfident, 0 underconfident, 1 about right." in summary
+    assert learner["answer_feedback"]["liked"] == 0
+
+    # An empty Library says there is nothing to go on.
+    empty = Library()
+    empty.cards, empty.events = {}, {}
+    (tmp_path / "empty").mkdir()
+    assert "The user has no review cards yet" in Server(empty, tmp_path / "empty").profile(topic="diffusion", levels=LEGACY)["summary"]
+
+
+def feedback(feedback_id, card_id, polarity, exact, comment, updated_at, deleted=False) -> dict:
+    record = {"feedback_id": feedback_id, "card_id": card_id, "polarity": polarity, "comment": comment,
+              "anchor": {"quote": {"exact": exact, "prefix": "", "suffix": ""}}, "created_at": updated_at,
+              "updated_at": updated_at, "origin_id": "test", "schema_version": 1}
+    if deleted:
+        record["deleted"] = True
+    return {"entity_type": "review_card_feedback", "entity_id": feedback_id, "collection": "review-feedback", "revision": 1,
+            "deleted": False, "payload": record}
+
+
+def phases_and_feedback(library):
+    """learner_layout plus a group asked before and after, one with a phase this client does not know,
+    and answer feedback: liked, disliked with a long quote and comment, an older one and a deleted one."""
+    learner_layout(library)
+    library.groups["groups"] += [{"group_id": "g-material", "name": "Material", "phase": "before_and_after", "tags": ["Paper", "Video"]},
+                                 {"group_id": "g-setup", "name": "Setup", "phase": "later", "scale": ["Phone", "Desk"]}]
+    library.add_event(answer("e6", KL, 4, 7, ["I kind of get it", "very interesting", "Studied", "Sure", "Tired", "Paper", "Desk"]))
+    library.extra += [feedback("f1", GRPO, "positive", "The advantage normalizes each reward", "", "2026-10-02T10:00:00.000Z"),
+                      feedback("f2", TENSOR, "negative", "Tensor parallel layers split " * 6, "Too   long,\nand vague " * 9,
+                               "2026-10-04T10:00:00.000Z"),
+                      feedback("f3", KL, "positive", "KL penalty", "Clear", "2026-10-03T10:00:00.000Z"),
+                      feedback("f4", KL, "negative", "deleted one", "", "2026-10-05T10:00:00.000Z", deleted=True),
+                      feedback("f5", PPO, "positive", "older", "", "2026-09-01T10:00:00.000Z")]
+
+
+def test_signals_follow_the_group_phases_and_the_learner_lists_answer_feedback(server, library):
+    phases_and_feedback(library)
+    topic = server.profile(topic="KL penalty", levels=LEGACY)
+    # Asked before and after (Material), or at a time this client does not know (Setup, asked after):
+    # signals; asked only before (Feeling): none. Feeling's steps stay unmapped, the signal sliders' do not.
+    assert topic["cards"]["shaky"][0]["signals"] == {"Interest": "Very interesting", "Effort": "Studied", "Confidence": "Sure",
+                                                     "Material": "Paper", "Setup": "Desk"}
+    # A row asked only before the answer (Feeling) says nothing about how well it is known: its steps are not unmapped levels.
+    assert "unmapped_understanding_tags" not in topic["mapping"]
+    assert topic["summary"].split("\n")[2:] == [
+        "Interest: typically Very interesting (Very interesting 1)", "Effort: typically Studied (Studied 1)",
+        "Confidence: typically Sure (Sure 1)", "Material: typically Paper (Paper 1)", "Setup: typically Desk (Desk 1)",
+        "Calibration (confidence before seeing the answer vs. the answer, 1 card): 1 overconfident, 0 underconfident, 0 about right.",
+        "Overconfident on: Why add a KL penalty to the reward?",
+        "What the cards say about the user in general:",
+        "In general (all 5 review cards): 2 solid, 1 shaky, 1 not understood, 1 not yet reviewed.",
+        "Studied: GRPO notes (2 cards, mostly solid, interest Interesting); rl_ppo (2 cards, mostly solid, interest Very interesting, "
+        "effort Studied, confidence Sure, material Paper, setup Desk); sys_parallel (1 card, mostly not understood, "
+        "interest Not interesting, effort Skimmed, confidence Guessing)",
+        "Interest: typically Interesting (Interesting 1, Not interesting 1, Very interesting 1)",
+        "Effort: typically Skimmed (Skimmed 1, Studied 1)",
+        "Confidence: typically Fairly sure (Guessing 1, Sure 1)",
+        "Material: typically Paper (Paper 1)",
+        "Setup: typically Desk (Desk 1)",
+        "Calibration (confidence before seeing the answer vs. the answer, 2 cards): 1 overconfident, 0 underconfident, 1 about right.",
+        "Overconfident on: Why add a KL penalty to the reward?",
+        "Knows well: How does GRPO compute the group-relative advantage?; What does the PPO clipping ratio bound?",
+        "Struggles with: What does tensor parallelism split?; Why add a KL penalty to the reward?",
+        'Answer feedback: liked 3 passages, disliked 1; latest: disliked "Tensor parallel layers split Tensor parallel layers split '
+        'Tensor parallel layers split Tensor parallel layers split Tensor parallel layers…" (Too long, and vague Too long, and vague '
+        'Too long, and vague Too long, and vague Too long, and vague Too long, and vague Too long, and vague Too long, and vagu…); '
+        'liked "KL penalty" (Clear); liked "The advantage normalizes each reward"']
+    # Newest first, the deleted one left out; a comment only when there is one.
+    assert topic["learner"]["answer_feedback"]["latest"][1:] == [{"polarity": "liked", "quote": "KL penalty", "comment": "Clear"},
+                                                                 {"polarity": "liked", "quote": "The advantage normalizes each reward"}]
+    assert topic["learner"]["documents"][1] == {
+        "document": "rl_ppo", "project": "RL", "cards": 2, "solid": 1, "shaky": 1, "unknown": 0, "unreviewed": 0,
+        "signals": {"Interest": {"typical": "Very interesting", "counts": {"Very interesting": 1}},
+                    "Effort": {"typical": "Studied", "counts": {"Studied": 1}},
+                    "Confidence": {"typical": "Sure", "counts": {"Sure": 1}},
+                    "Material": {"typical": "Paper", "counts": {"Paper": 1}},
+                    "Setup": {"typical": "Desk", "counts": {"Desk": 1}}}}
+    assert topic["learner"]["knows_well"][0] == {"question": "How does GRPO compute the group-relative advantage?", "document": "GRPO notes"}
 
 
 def test_default_levels_read_the_slider_steps(server, library):
@@ -255,12 +389,14 @@ def test_default_levels_read_the_slider_steps(server, library):
     assert result["counts"] == {"solid": 2, "shaky": 1, "unknown": 0, "unreviewed": 1}
     levels = result["mapping"]["levels"]
     assert result["mapping"]["source"] == "default mapping"
-    assert levels["Know by heart"] == "solid" and levels["Forgot"] == "unknown" and "Correct" not in levels
+    assert levels["Partly"] == "shaky" and "Correct" not in levels
+    # The Recall steps (now Confidence's, asked before the answer) are no levels: calibration compares them with the answer.
+    assert "Know by heart" not in levels and "Forgot" not in levels
     assert levels == dict(knowledge.DEFAULT_LEVELS)
-    # Forgot after Recalled long ago: not understood; the old answers read under the new names.
+    # Forgot after Recalled long ago, and no Understanding answer: only its interval tells how well it is known.
     tensor = server.profile(topic="tensor parallelism")
-    assert tensor["counts"]["unknown"] == 1
-    assert tensor["cards"]["unknown"][0]["reason"].startswith("last 2 answers: Forgot, Recalled")
+    assert tensor["counts"]["shaky"] == 1
+    assert tensor["cards"]["shaky"][0]["reason"].startswith("2 answers, none with an understanding tag")
 
 
 def test_deleted_cards_are_left_out(server):
@@ -321,7 +457,7 @@ def test_bad_requests(server):
     other = server.profile(topic="RL", document="sys_parallel")
     assert other["accepted"] and other["matched"] == 0 and other["document"] == "sys_parallel"
     assert code(topic="RL", levels={"Correct": "great"}) == "invalid_levels"
-    assert "solid, shaky, unknown, ignore" in server.profile(topic="RL", levels={"Correct": "great"})["message"]
+    assert "solid, shaky, unknown, own, ignore" in server.profile(topic="RL", levels={"Correct": "great"})["message"]
     assert code(topic="RL", levels={"schema_version": 2, "levels": {}}) == "invalid_levels"
 
 
@@ -360,15 +496,36 @@ def test_lapses_overdue_and_never_asked_again(server, library):
     for event_id, days_ago, rating in (("l1", 90, "easy"), ("l2", 80, "again"), ("l3", 79, "good"), ("l4", 70, "again"),
                                        ("l5", 69, "good")):
         library.add_event({"event_id": event_id, "card_id": lapsed, "reviewed_at": iso(NOW - timedelta(days=days_ago)),
-                           "rating": rating, "scheduler_version": 2, "review_tags": ["Recalled"], "origin_id": "test"})
+                           "rating": rating, "scheduler_version": 2, "review_tags": ["I get it"], "origin_id": "test"})
     retained = "00000000-0000-4000-8000-0000000000b2"
     library.add_card(card(retained, "rl_ppo", "Who proposed PPO clipping?"))
     library.add_event({"event_id": "n1", "card_id": retained, "reviewed_at": iso(NOW - timedelta(days=2)), "rating": "retained",
                        "review_tags": ["I get it"], "origin_id": "test"})
     result = server.profile(topic="PPO clipping")
-    # Recalled every time (1.0), 2 lapses (-0.2), relearned to a 1-day interval and 68 days overdue (-0.15): 0.65.
-    assert reason_of(result, "shaky", lapsed) == "last 3 answers: Recalled, Recalled, Recalled; interval 1 d; 2 lapses; overdue 68 d"
+    # Understood every time (1.0), 2 lapses (-0.2), relearned to a 1-day interval and 68 days overdue (-0.15): 0.65.
+    assert reason_of(result, "shaky", lapsed) == "last 3 answers: I get it, I get it, I get it; interval 1 d; 2 lapses; overdue 68 d"
     assert reason_of(result, "solid", retained) == "last answer: I get it; never asked again"
+
+
+def test_own_ideas_are_solid_whatever_the_schedule_says(server, library):
+    # The user came up with it once, then relearned it twice and left it long overdue: still their own idea.
+    own = "00000000-0000-4000-8000-0000000000b3"
+    library.add_card(card(own, "rl_ppo", "Why clip the PPO value loss per sample?"))
+    for event_id, days_ago, rating, tags in (("o1", 90, "easy", ["I came up with it"]), ("o2", 80, "again", ["Partly"]),
+                                             ("o3", 79, "good", ["Partly"]), ("o4", 70, "again", []), ("o5", 69, "good", [])):
+        library.add_event({"event_id": event_id, "card_id": own, "reviewed_at": iso(NOW - timedelta(days=days_ago)),
+                           "rating": rating, "scheduler_version": 2, "review_tags": tags, "origin_id": "test"})
+    result = server.profile(topic="PPO value loss")
+    assert result["mapping"]["levels"]["I came up with it"] == "own"
+    entry = next(c for c in result["cards"]["solid"] if c["card_id"] == own)
+    assert entry["reason"] == "own idea (I came up with it)" and entry["own_idea"] is True
+    assert any(line.startswith("The user's own ideas (they came up with them; build on them, don't explain them back): Why clip")
+               for line in result["summary"].splitlines())
+    # Other cards carry no flag; a given mapping may name the level too.
+    assert all("own_idea" not in c for cards in result["cards"].values() for c in cards if c["card_id"] != own)
+    custom = server.profile(topic="PPO value loss", levels={"Partly": "shaky", "I came up with it": "ignore"})
+    assert reason_of(custom, "unknown", own).startswith("last 2 answers: Partly, Partly")
+    assert server.profile(topic="PPO value loss", levels={"Partly": "own"})["cards"]["solid"][0]["own_idea"] is True
 
 
 def test_skips_retractions_and_inferred_deletions(server, library):
@@ -456,7 +613,8 @@ def test_reads_only_and_only_allowed_routes(server):
     assert {path for _, path in server.requests} >= {"/v1/projections", "/v1/library/projects", "/v1/sources"}
     # The JSON of the Mac: keys in order, as a QJsonObject writes them.
     assert list(result) == sorted(result)
-    assert list(result) == ["accepted", "cards", "counts", "index", "mapping", "matched", "project", "schema_version",
+    # Two cards match: the learner overview comes along.
+    assert list(result) == ["accepted", "cards", "counts", "index", "learner", "mapping", "matched", "project", "schema_version",
                             "summary", "topic"]
     assert list(result["cards"]) == ["shaky", "solid", "unknown", "unreviewed"]
 
@@ -476,3 +634,42 @@ def test_words_and_text_helpers():
     assert passages == ["  second", "first"]
     mapping = knowledge.merge_mapping([merge("b", "C", ["B"], "2"), merge("a", "B", ["A"], "1"), merge("c", "", ["X"], "0")])
     assert mapping == {"A": "C", "B": "C"}
+
+
+def kinds_module():
+    kinds = thoughts_connector.review_kinds()
+    if kinds is None:
+        pytest.skip("needs thoughts-cli with review_kinds (THOUGHTS_CLI, thoughts-cli 1.10.0)")
+    return kinds
+
+
+def test_project_cards_are_listed_apart(server, library):
+    """thoughts-server protocol/review-card-kinds.md section 8: project cards are not knowledge."""
+    kinds = kinds_module()
+    before = server.profile(topic="tensor parallelism", levels=LEGACY, kinds=kinds)
+    assert before == server.profile(topic="tensor parallelism", levels=LEGACY) and "project_cards" not in before
+    # The Systems Project holds work in progress: its cards follow it.
+    library.projects[1]["review_kind"] = "project"
+    result = server.profile(topic="tensor parallelism", levels=LEGACY, kinds=kinds)
+    assert result["matched"] == 0 and ids(result) == set()
+    assert result["project_cards"] == {"count": 1, "cards": [
+        {"card_id": TENSOR, "question": "What does tensor parallelism split?", "document": "sys_parallel",
+         "project": "Systems"}]}
+    lines = result["summary"].splitlines()
+    assert lines[0] == 'No knowledge cards match "tensor parallelism": there is no record of what the user knows about it.'
+    assert "Project cards on this topic (work in progress, not what the user knows): What does tensor parallelism split?" \
+        in lines
+    # The learner overview leaves it out too.
+    learner = json.dumps(result["learner"])
+    assert "tensor parallelism" not in learner
+    # A card set by hand: KL becomes a project card, PPO stays knowledge in a knowledge Project.
+    library.add_event({"schema_version": 3, "event_id": "k1", "card_id": KL, "queue_action": "set_review_kind",
+                       "review_kind": "project", "reviewed_at": iso(NOW - timedelta(hours=1)), "origin_id": "phone"})
+    mixed = server.profile(topic="PPO KL penalty clipping", levels=LEGACY, kinds=kinds)
+    assert KL not in ids(mixed) and PPO in ids(mixed)
+    assert [c["card_id"] for c in mixed["project_cards"]["cards"]] == [KL]
+    assert mixed["matched"] == len(ids(mixed))
+    # follow_project gives KL back to its knowledge Project.
+    library.add_event({"schema_version": 3, "event_id": "k2", "card_id": KL, "queue_action": "set_review_kind",
+                       "review_kind": "follow_project", "reviewed_at": iso(NOW), "origin_id": "mac"})
+    assert KL in ids(server.profile(topic="PPO KL penalty clipping", levels=LEGACY, kinds=kinds))

@@ -4,7 +4,10 @@
 A port of the Mac's `thoughtsctl knowledge-profile` (thoughts-desktop shell/reviewknowledge.cpp,
 ReviewKnowledge::profile and findCards, with the card fold of shell/reviewstore.cpp: answers,
 tags, tag merges, tag groups, the schedule and retirement) to the connector. Same request,
-same classification, same JSON.
+same classification, same JSON. As on the Mac, that includes each card's signals (the tags of its
+last answer from the user's other tag groups, such as Interest and Effort; a group asked only before
+the answer gives none, except Confidence), calibration against a Confidence slider, the learner
+overview when few cards match, and summary lists of up to 10 questions.
 
 The Mac reads its review index (review-query.sqlite, the server's projections as of its last
 Sync), the Library catalogue and the local sources. Here the same facts come from the Thoughts
@@ -35,13 +38,16 @@ ZONE = ZoneInfo(os.environ.get("THOUGHTS_DIARY_ZONE", "Europe/Zurich"))
 DEFAULT_LIMIT = 40
 MAXIMUM_LIMIT = 200
 MAXIMUM_TEXT_LENGTH = 2000
-LEVEL_NAMES = ("solid", "shaky", "unknown", "ignore")
+# "own": the user came up with it (an idea of their own), so they know it best whatever the schedule says.
+LEVEL_NAMES = ("solid", "shaky", "unknown", "own", "ignore")
 CLASSES = ("solid", "shaky", "unknown", "unreviewed")
-# ReviewKnowledge::defaultLevels(): the user's slider groups (2026-10-15). Understanding and Recall
-# say how well the answer is known; Interest, Study, Material and Source say nothing about it.
+# ReviewKnowledge::defaultLevels(): the user's slider groups. Understanding, answered after seeing the
+# answer, says how well it is known. Confidence (once called Recall, asked before the answer)
+# is what calibration compares with that, so it is no level; Interest, Study effort, Feeling and Setup
+# say nothing about it. "I came up with it" marks the user's own idea.
 DEFAULT_LEVELS = (
-    ("I get it", "solid"), ("Deeply", "solid"), ("Recalled", "solid"), ("Know by heart", "solid"),
-    ("Partly", "shaky"), ("Partly recalled", "shaky"), ("Don't get it", "unknown"), ("Forgot", "unknown"),
+    ("I get it", "solid"), ("Deeply", "solid"), ("Partly", "shaky"), ("Don't get it", "unknown"),
+    ("Doubtful", "shaky"), ("I came up with it", "own"),
 )
 STOP_WORDS = frozenset("a an and are as at be by do does for from how in is it its of on or that the this to what "
                        "when which why with".split())
@@ -66,6 +72,16 @@ CORRECT, WRONG, SKIP = "correct", "wrong", "skip"
 TAGS_COLLECTION = "review-tags"
 GROUPS_ID = "groups"
 OTHER_GROUP = "Other"
+# ReviewTags::beforePhase() / beforeAndAfterPhase(): when a group is asked (review-phases spec).
+BEFORE_PHASE = "before"
+BEFORE_AND_AFTER_PHASE = "before_and_after"
+# How many questions a summary line lists: enough for an agent to see every weak point of a topic.
+SUMMARY_LIST_LIMIT = 10
+# Project cards listed apart from the knowledge cards (protocol/review-card-kinds.md section 8).
+PROJECT_CARDS_LIMIT = 20
+# Answer feedback (thoughts-server protocol/review-card-feedback.md): liked and disliked passages of answers.
+CARD_FEEDBACK_ENTITY = "review_card_feedback"
+CARD_FEEDBACK_COLLECTION = "review-feedback"
 OTHER_NOTE_KEY = "other"
 ANSWER_NOTE_KEY = "note"
 
@@ -109,6 +125,12 @@ def _number(value) -> float:
 def _qround(value: float) -> int:
     """qRound / std::round for the non-negative values here: halves away from zero."""
     return math.floor(value + 0.5)
+
+
+def _lround(value: float) -> int:
+    """std::lround for a non-negative value: the nearest whole number, halves away from zero."""
+    whole = math.floor(value)
+    return whole + 1 if value - whole >= 0.5 else whole
 
 
 # ---------------------------------------------------------------- text as Qt handles it
@@ -333,6 +355,8 @@ class TagGroup:
     tags: list[str] = field(default_factory=list)
     scale: list[str] = field(default_factory=list)
     section: str = ""
+    # BEFORE_PHASE, BEFORE_AND_AFTER_PHASE, or empty: asked after the answer only.
+    phase: str = ""
 
 
 def groups_error(groups: list[TagGroup]) -> str:
@@ -390,6 +414,9 @@ def parse_groups(record: dict) -> list[TagGroup] | None:
         section = _str(value, "section").strip()
         if len(section) <= 60:
             group.section = section
+        # A phase this client knows; another value (a newer client's) is asked after the answer.
+        if _str(value, "phase") in (BEFORE_PHASE, BEFORE_AND_AFTER_PHASE):
+            group.phase = value["phase"]
         parsed.append(group)
     return None if groups_error(parsed) else parsed
 
@@ -412,7 +439,7 @@ def effective_groups(groups: list[TagGroup], mapping: dict[str, str]) -> list[Ta
                     owner[tag] = index
     result = []
     for index, group in enumerate(groups):
-        shown = TagGroup(group.id, group.name.strip(), section=group.section)
+        shown = TagGroup(group.id, group.name.strip(), section=group.section, phase=group.phase)
         for stored in group.tags:
             tag, _ = shown_name(stored)
             if tag and owner.get(tag, -1) == index and tag not in shown.tags:
@@ -815,6 +842,8 @@ class Library:
     merges: dict[str, str]
     groups: list[TagGroup]
     projects: list[dict]
+    # The answer feedback records (deleted ones included), as the Mac's index holds them.
+    feedback: list[dict] = field(default_factory=list)
 
 
 def library_of(cards: dict, events: dict, projections: list, projects: list) -> Library:
@@ -822,10 +851,18 @@ def library_of(cards: dict, events: dict, projections: list, projects: list) -> 
     candidates or rejected cards), with their schedule, answers and tag merges.
 
     cards and events are what Thoughts.review() returns; projections the /v1/projections records
-    (for the tag merges and groups); projects what Thoughts.projects() returns."""
+    (for the tag merges and groups, and the answer feedback); projects what Thoughts.projects() returns."""
     tag_records: dict[str, list[dict]] = {"review_tag_merge": [], "review_tag_groups": []}
+    feedback = []
     for projection in projections:
         kind, payload = projection.get("entity_type"), projection.get("payload")
+        if kind == CARD_FEEDBACK_ENTITY:
+            # As the Mac's index holds them: each record under its own feedback_id, deleted ones included.
+            feedback_id = _str(payload, "feedback_id")
+            if (not projection.get("deleted") and feedback_id and feedback_id == projection.get("entity_id", feedback_id)
+                    and projection.get("collection", CARD_FEEDBACK_COLLECTION) == CARD_FEEDBACK_COLLECTION):
+                feedback.append(payload)
+            continue
         if kind not in tag_records or projection.get("deleted") or not isinstance(payload, dict):
             continue
         if projection.get("collection", TAGS_COLLECTION) != TAGS_COLLECTION:
@@ -875,7 +912,9 @@ def library_of(cards: dict, events: dict, projections: list, projects: list) -> 
         library.append(Card(record, schedule, skipped.get(card_id), history, merges, retired=card_id in retired,
                             unpublished=bool(unpublished) and card_document_id(record, projects) in unpublished,
                             answers=[event for event in effective_answers(card_id, history) if _is_answer(event)]))
-    return Library(library, merges, groups, projects)
+    # In feedback_id order (the Mac's hash order is arbitrary): ties of updated_at keep this order.
+    feedback.sort(key=lambda record: _str(record, "feedback_id"))
+    return Library(library, merges, groups, projects, feedback)
 
 
 def _card_reviewed_after(schedule: Schedule | None, skip: dict) -> bool:
@@ -980,6 +1019,11 @@ class Entry:
     tags: list[str] = field(default_factory=list)
     answer: list[str] = field(default_factory=list)
     score: float = 0.0
+
+
+def is_project_card(card: Card, projects: list[dict], kinds) -> bool:
+    """A project card (protocol/review-card-kinds.md section 3): about work in progress, not knowledge."""
+    return kinds is not None and kinds.card_kind(card.record, card.history, projects).is_project
 
 
 def error(code: str, message: str) -> dict:
@@ -1089,10 +1133,10 @@ def load_levels(levels) -> tuple[list[tuple[str, str]], str] | dict:
     if isinstance(levels, dict) and "levels" in levels:
         if _int(levels.get("schema_version")) != 1 or not isinstance(levels.get("levels"), dict):
             return error("invalid_levels", 'levels is not a knowledge level mapping: expected {"schema_version": 1, '
-                                           '"levels": {"<tag>": "solid"|"shaky"|"unknown"|"ignore"}}.')
+                                           '"levels": {"<tag>": "solid"|"shaky"|"unknown"|"own"|"ignore"}}.')
         levels = levels["levels"]
     if not isinstance(levels, dict):
-        return error("invalid_levels", 'levels must map each tag to "solid", "shaky", "unknown" or "ignore".')
+        return error("invalid_levels", 'levels must map each tag to "solid", "shaky", "unknown", "own" or "ignore".')
     result = []
     # In key order, as a JSON object reads in Qt.
     for tag in sorted(levels):
@@ -1144,15 +1188,371 @@ def _optional_text(value, name: str) -> tuple[str, str | None]:
     return value.strip(), None
 
 
+# ---------------------------------------------------------------- assessing, signals, the learner
+
+@dataclass
+class Assessment:
+    """How well one card's answer is known: solid, shaky, unknown (not understood) or unreviewed."""
+    level: str
+    reason: list[str]
+    own_idea: bool = False  # The user came up with it: solid, whatever the schedule says.
+
+
+def assess(card: Card, level_of: dict[str, str], now: datetime) -> Assessment:
+    schedule = card.schedule
+    overdue = due_of(card, now).overdue_days
+    reason = []
+    own = next((tag_label(tag) for answer in card.answers for tag in card.tags_of_event(answer)
+                if level_of.get(fold_case(tag)) == "own"), None)
+    if own is not None:
+        # An idea of the user's own: they know it best, however long ago it was reviewed.
+        return Assessment("solid", [f"own idea ({own})"] + (["retired"] if card.retired else []), True)
+    if not card.was_answered:
+        level = "unreviewed"
+        reason.append("never answered")
+    else:
+        # Newest first: each answer at the lowest level of its mapped tags.
+        rated = []
+        for answer in reversed(card.answers):
+            value, shown = None, []
+            for tag in card.tags_of_event(answer):
+                tag_level = level_of.get(fold_case(tag), "")
+                if not tag_level or tag_level == "ignore":
+                    continue
+                value = min(1.0 if value is None else value, level_value(tag_level))
+                shown.append(tag_label(tag))
+            if value is not None:
+                rated.append((value, shown))
+        score = 0.0
+        if not rated:
+            # Answered, but never with a tag that says how well: only the interval chosen tells.
+            score = 0.8 if schedule.interval_days >= 21 and schedule.lapse_count == 0 else 0.5
+            reason.append(f"{_plural(len(card.answers), 'answer')}, none with an understanding tag")
+        else:
+            # The latest answer weighs most: each older one half as much as the next.
+            weight, total = 1.0, 0.0
+            for value, _ in rated:
+                score += weight * value
+                total += weight
+                weight /= 2
+            score /= total
+            shown = ["+".join(tags) for _, tags in rated[:3]]
+            reason.append(f"last answer: {shown[0]}" if len(rated) == 1 else f"last {len(shown)} answers: {', '.join(shown)}")
+        if schedule.lapse_count > 0:
+            score -= 0.1 * min(schedule.lapse_count, 3)
+        if schedule.interval_days >= 30:
+            score += 0.1
+        # Long past due: it may have faded since.
+        if overdue > max(7, schedule.interval_days):
+            score -= 0.15
+        level = "solid" if score >= 0.75 else "shaky" if score >= 0.4 else "unknown"
+        if schedule.retained:
+            reason.append("never asked again")
+        elif schedule.interval_days > 0:
+            reason.append(f"interval {days_text(schedule.interval_days)}")
+        if schedule.lapse_count > 0:
+            reason.append(_plural(schedule.lapse_count, "lapse"))
+    if overdue > 0:
+        reason.append(f"overdue {overdue} d")
+    if card.retired:
+        reason.append("retired")
+    return Assessment(level, reason)
+
+
+@dataclass
+class SignalGroups:
+    """What the tags outside the knowledge levels say: the tag groups such as Interest, Effort or
+    Material, by the name each tag is shown under now."""
+    group_of: dict[str, str] = field(default_factory=dict)        # case-folded tag -> group name
+    name_of: dict[str, str] = field(default_factory=dict)         # case-folded tag -> the tag as the group spells it
+    scale_of: dict[str, list[str]] = field(default_factory=dict)  # group name -> its slider steps, lowest first
+    order: list[str] = field(default_factory=list)                # group names in the user's order
+
+
+def signal_groups(library: Library, level_of: dict[str, str]) -> SignalGroups:
+    result = SignalGroups()
+
+    def knowledge_tag(tag: str) -> bool:
+        level = level_of.get(fold_case(tag), "")
+        return bool(level) and level != "ignore"
+
+    for group in library.groups:
+        # Groups that say how well the answer is known (Understanding, Recall) are the knowledge
+        # levels' job, including their tags without a level.
+        if any(knowledge_tag(tag) for tag in group.tags) or any(knowledge_tag(tag) for tag in group.scale):
+            continue
+        # Groups asked only before the answer say how the review went (Feeling, Setup: tired,
+        # on the phone), not what the user thinks of the card. Confidence is the one about the
+        # card, and calibration compares it with the answer.
+        if group.phase == BEFORE_PHASE and fold_case(group.name) != "confidence":
+            continue
+        added = False
+        for tag in group.scale + group.tags:
+            key = fold_case(tag)
+            if key in result.group_of:
+                continue
+            result.group_of[key] = group.name
+            result.name_of[key] = tag_label(tag)
+            added = True
+        if not added:
+            continue
+        if group.scale:
+            result.scale_of[group.name] = group.scale
+        if group.name not in result.order:
+            result.order.append(group.name)
+    return result
+
+
+def signals_of(card: Card, groups: SignalGroups) -> list[tuple[str, str]]:
+    """The signal tags of the card's latest answer that has any, as (group, tag) pairs."""
+    for answer in reversed(card.answers):
+        found = [(groups.group_of[fold_case(tag)], groups.name_of[fold_case(tag)])
+                 for tag in card.tags_of_event(answer) if fold_case(tag) in groups.group_of]
+        if found:
+            return found
+    return []
+
+
+class SignalTally:
+    """Counts of each signal tag over some cards, per group."""
+
+    def __init__(self):
+        self.counts: dict[str, dict[str, int]] = {}
+
+    def add(self, signals: list[tuple[str, str]]) -> None:
+        for group, tag in signals:
+            tags = self.counts.setdefault(group, {})
+            tags[tag] = tags.get(tag, 0) + 1
+
+    def __bool__(self) -> bool:
+        return bool(self.counts)
+
+    def typical(self, group: str, groups: SignalGroups) -> str:
+        """The step at the cards' mean position for a slider, the most frequent tag otherwise."""
+        tags = self.counts.get(group, {})
+        scale = groups.scale_of.get(group, [])
+        total, n = 0.0, 0
+        for tag, count in tags.items():
+            if tag in scale:
+                total += float(scale.index(tag)) * count
+                n += count
+        if n:
+            return scale[_lround(total / n)]
+        best, most = "", 0
+        for tag, count in tags.items():
+            if count > most or (count == most and tag < best):
+                best, most = tag, count
+        return best
+
+    def json(self, groups: SignalGroups) -> dict:
+        return {group: {"typical": self.typical(group, groups), "counts": dict(self.counts[group])}
+                for group in groups.order if group in self.counts}
+
+    def lines(self, groups: SignalGroups) -> list[str]:
+        """"Interest: typically Interesting (Interesting 3, Somewhat 1)", one line per group."""
+        result = []
+        for group in groups.order:
+            if group not in self.counts:
+                continue
+            shown = ", ".join(f"{tag} {count}" for tag, count in sorted(self.counts[group].items(), key=lambda item: (-item[1], item[0])))
+            result.append(f"{group}: typically {self.typical(group, groups)} ({shown})")
+        return result
+
+
+def joined_signals(signals: list[tuple[str, str]], group: str) -> str:
+    return "+".join(tag for name, tag in signals if name == group)
+
+
+class CalibrationTally:
+    """Calibration: how sure the user was before seeing the answer (a "Confidence" slider, lowest step
+    first) against how well they turned out to know it. A gap of half the range or more counts as
+    over- or underconfident, as in Lee et al., CHI 2025: predicted minus actual."""
+
+    def __init__(self):
+        self.overconfident: list[str] = []
+        self.underconfident: list[str] = []
+        self.calibrated = 0
+
+    @staticmethod
+    def group(groups: SignalGroups) -> str:
+        return next((name for name in groups.order
+                     if fold_case(name) == "confidence" and len(groups.scale_of.get(name, [])) > 1), "")
+
+    def add(self, signals: list[tuple[str, str]], level: str, question: str, groups: SignalGroups) -> None:
+        name = self.group(groups)
+        if not name or level == "unreviewed":
+            return
+        scale = groups.scale_of[name]
+        for signal_group, tag in signals:
+            if signal_group != name or tag not in scale:
+                continue
+            gap = float(scale.index(tag)) / float(len(scale) - 1) - level_value(level)
+            if gap >= 0.5:
+                self.overconfident.append(question)
+            elif gap <= -0.5:
+                self.underconfident.append(question)
+            else:
+                self.calibrated += 1
+            return
+
+    def total(self) -> int:
+        return len(self.overconfident) + len(self.underconfident) + self.calibrated
+
+    def json(self) -> dict:
+        return {"cards": self.total(), "calibrated": self.calibrated, "overconfident": list(self.overconfident),
+                "underconfident": list(self.underconfident)}
+
+    def lines(self, limit: int) -> list[str]:
+        if self.total() == 0:
+            return []
+        result = [f"Calibration (confidence before seeing the answer vs. the answer, {_plural(self.total(), 'card')}): "
+                  f"{len(self.overconfident)} overconfident, {len(self.underconfident)} underconfident, {self.calibrated} about right."]
+        if self.overconfident:
+            result.append("Overconfident on: " + "; ".join(self.overconfident[:limit]))
+        if self.underconfident:
+            result.append("Underconfident on: " + "; ".join(self.underconfident[:limit]))
+        return result
+
+
+def cut(text: str, length: int) -> str:
+    line = simplified(text)
+    return _left(line, length - 2).strip() + "…" if _units(line) > length else line
+
+
+@dataclass
+class _Document:
+    name: str = ""
+    project: str = ""
+    levels: dict[str, int] = field(default_factory=dict)
+    signals: SignalTally = field(default_factory=SignalTally)
+    cards: int = 0
+
+
+def learner_overview(library: Library, every: list[Entry], level_of: dict[str, str], groups: SignalGroups,
+                     now: datetime) -> tuple[dict, list[str]]:
+    """What all of the user's cards say about them as a learner, for topics no card covers yet: how
+    much they know and where, what they find interesting, how they study, and what they liked and
+    disliked in answers. Returns the JSON and its plain-language lines."""
+    counts: dict[str, int] = {}
+    documents: dict[str, _Document] = {}
+    document_order: list[str] = []
+    signals = SignalTally()
+    calibration = CalibrationTally()
+    solid, weak = [], []  # (last reviewed at, question, document)
+    for entry in every:
+        card = entry.card
+        assessment = assess(card, level_of, now)
+        counts[assessment.level] = counts.get(assessment.level, 0) + 1
+        card_signals = signals_of(card, groups)
+        signals.add(card_signals)
+        calibration.add(card_signals, assessment.level, short_question(card.question), groups)
+        name = entry.document_name or entry.pdf_filename
+        if name not in documents:
+            document_order.append(name)
+        document = documents.setdefault(name, _Document())
+        document.name = name
+        document.project = entry.project
+        document.cards += 1
+        document.levels[assessment.level] = document.levels.get(assessment.level, 0) + 1
+        document.signals.add(card_signals)
+        example = (card.schedule.last_reviewed_at, short_question(card.question), name)
+        if assessment.level == "solid":
+            solid.append(example)
+        elif assessment.level in ("unknown", "shaky"):
+            weak.append(example)
+    # Newest first, never reviewed last; stable, as std::stable_sort.
+    solid.sort(key=lambda example: example[0] or _NEVER, reverse=True)
+    weak.sort(key=lambda example: example[0] or _NEVER, reverse=True)
+    document_order.sort(key=lambda name: -documents[name].cards)
+
+    def mostly(levels: dict[str, int]) -> str:
+        best, most = "", 0
+        for name in CLASSES:
+            if levels.get(name, 0) > most:
+                best, most = name, levels.get(name, 0)
+        return "not understood" if best == "unknown" else "not yet reviewed" if best == "unreviewed" else best
+
+    documents_json, document_lines = [], []
+    for name in document_order[:8]:
+        document = documents[name]
+        item = {"document": document.name, "cards": document.cards}
+        if document.project:
+            item["project"] = document.project
+        for level in CLASSES:
+            item[level] = document.levels.get(level, 0)
+        if document.signals:
+            item["signals"] = document.signals.json(groups)
+        documents_json.append(item)
+        line = f"{document.name} ({_plural(document.cards, 'card')}, mostly {mostly(document.levels)}"
+        for group in groups.order:
+            if group in document.signals.counts:
+                line += f", {group.lower()} {document.signals.typical(group, groups)}"
+        document_lines.append(line + ")")
+
+    def questions_of(examples: list) -> list[dict]:
+        return [{"question": question, "document": document} for _, question, document in examples[:5]]
+
+    # Answer feedback: the passages of answers the user liked or disliked, newest first.
+    liked = disliked = 0
+    feedback = []
+    for record in library.feedback:
+        if record.get("deleted") is True:
+            continue
+        if _str(record, "polarity") == "negative":
+            disliked += 1
+        else:
+            liked += 1
+        feedback.append(record)
+    feedback.sort(key=lambda record: _str(record, "updated_at"), reverse=True)
+    feedback_json, feedback_lines = [], []
+    for record in feedback[:3]:
+        polarity = "disliked" if _str(record, "polarity") == "negative" else "liked"
+        quote = cut(_str(_obj(_obj(record, "anchor"), "quote"), "exact"), 140)
+        comment = cut(_str(record, "comment"), 160)
+        item = {"polarity": polarity, "quote": quote}
+        if comment:
+            item["comment"] = comment
+        feedback_json.append(item)
+        feedback_lines.append(f'{polarity} "{quote}"' + (f" ({comment})" if comment else ""))
+
+    lines = []
+    total = len(every)
+    if total == 0:
+        lines.append("The user has no review cards yet, so nothing is known about them as a learner.")
+    else:
+        lines.append(f"In general (all {_plural(total, 'review card')}): {counts.get('solid', 0)} solid, {counts.get('shaky', 0)} shaky, "
+                     f"{counts.get('unknown', 0)} not understood, {counts.get('unreviewed', 0)} not yet reviewed.")
+        lines.append("Studied: " + "; ".join(document_lines))
+        lines += signals.lines(groups)
+        lines += calibration.lines(5)
+        if solid:
+            lines.append("Knows well: " + "; ".join(question for _, question, _ in solid[:3]))
+        if weak:
+            lines.append("Struggles with: " + "; ".join(question for _, question, _ in weak[:3]))
+        if liked + disliked > 0:
+            lines.append(f"Answer feedback: liked {_plural(liked, 'passage')}, disliked {disliked}; latest: " + "; ".join(feedback_lines))
+    overview = {"cards": total, "counts": {name: counts.get(name, 0) for name in CLASSES}, "documents": documents_json,
+                "signals": signals.json(groups), "calibration": calibration.json(),
+                "knows_well": questions_of(solid), "struggles_with": questions_of(weak),
+                "answer_feedback": {"liked": liked, "disliked": disliked, "latest": feedback_json}}
+    return overview, lines
+
+
 async def knowledge_profile(thoughts, *, topic: str, project: str | None = None, document: str | None = None,
-                            limit: int = DEFAULT_LIMIT, now: datetime | None = None, levels: dict | None = None) -> dict:
+                            limit: int = DEFAULT_LIMIT, now: datetime | None = None, levels: dict | None = None,
+                            learner: bool | None = None, kinds=None) -> dict:
     """What the user knows about topic, from their review cards (read-only): the Mac's knowledge-profile.
 
     thoughts is the connector's Thoughts server wrapper (review, ttl, projects and source are read).
     Returns the Mac's JSON (schema_version 1): accepted, topic, matched, counts and cards per class
-    (solid, shaky, unknown, unreviewed), summary, index, mapping, and project/document when given;
-    or accepted false with error_code (invalid_request, invalid_levels, unknown_project,
-    unknown_document) and message."""
+    (solid, shaky, unknown, unreviewed; each card with its signals when its last answer has any),
+    summary, index, mapping, calibration (with a Confidence slider), learner (when fewer than 3 cards
+    match, or as learner says), and project/document when given; or accepted false with error_code
+    (invalid_request, invalid_levels, unknown_project, unknown_document) and message.
+
+    kinds is thoughts_cli.review_kinds (thoughts-server protocol/review-card-kinds.md section 8): project
+    cards are not knowledge, so only knowledge cards are classified; matching project cards are listed apart
+    under project_cards. None (an older thoughts-cli): every card counts, as before."""
     loaded = load_levels(levels)
     if isinstance(loaded, dict):
         return loaded
@@ -1161,6 +1561,8 @@ async def knowledge_profile(thoughts, *, topic: str, project: str | None = None,
     if problem is None and (isinstance(limit, bool) or not isinstance(limit, (int, float))
                             or not float(limit).is_integer() or not 1 <= limit <= MAXIMUM_LIMIT):
         problem = f"limit must be a whole number from 1 to {MAXIMUM_LIMIT}."
+    if problem is None and learner is not None and not isinstance(learner, bool):
+        problem = "learner must be true or false."
     if problem is None and not topic:
         problem = 'topic must name what to profile, for example "GRPO advantage".'
     project, project_problem = _optional_text(project, "project")
@@ -1194,6 +1596,8 @@ async def knowledge_profile(thoughts, *, topic: str, project: str | None = None,
     if entries:
         best = entries[0].score
         entries = [entry for entry in entries if not entry.score < best * 0.2]
+    projects_matched = [entry for entry in entries if is_project_card(entry.card, library.projects, kinds)]
+    entries = [entry for entry in entries if not is_project_card(entry.card, library.projects, kinds)]
     matched = len(entries)
     entries = entries[:limit]
 
@@ -1206,75 +1610,45 @@ async def knowledge_profile(thoughts, *, topic: str, project: str | None = None,
         mapping[tag_label(normalized)] = level
     unmapped: list[str] = []
     for group in library.groups:
-        # The Understanding group, and the steps of every slider: each step should have a level.
+        # The Understanding group, and the steps of every slider: each step should have a level. Groups
+        # asked only before the answer (Confidence, Feeling, Setup) say nothing about how well it is known.
+        if group.phase == BEFORE_PHASE:
+            continue
         understanding = fold_case(group.name) == "understanding"
         for tag in group.tags if understanding else group.scale:
             if fold_case(tag) not in level_of and tag_label(tag) not in unmapped:
                 unmapped.append(tag_label(tag))
 
+    # Interest, Effort and the other groups: what the user said besides how well they know it.
+    groups = signal_groups(library, level_of)
+    unmapped = [tag for tag in unmapped if not (fold_case(tag) in groups.group_of and groups.group_of[fold_case(tag)] in groups.scale_of)]
+
     by_class: dict[str, list] = {name: [] for name in CLASSES}
     questions: dict[str, list] = {name: [] for name in CLASSES}
+    topic_signals = SignalTally()
+    topic_calibration = CalibrationTally()
+    own_ideas: list[str] = []
     for entry in entries:
-        card, schedule = entry.card, entry.card.schedule
-        overdue = due_of(card, now).overdue_days
-        reason = []
-        if not card.was_answered:
-            level = "unreviewed"
-            reason.append("never answered")
-        else:
-            # Newest first: each answer at the lowest level of its mapped tags.
-            rated = []
-            for answer in reversed(card.answers):
-                value, shown = None, []
-                for tag in card.tags_of_event(answer):
-                    tag_level = level_of.get(fold_case(tag), "")
-                    if not tag_level or tag_level == "ignore":
-                        continue
-                    value = min(1.0 if value is None else value, level_value(tag_level))
-                    shown.append(tag_label(tag))
-                if value is not None:
-                    rated.append((value, shown))
-            score = 0.0
-            if not rated:
-                # Answered, but never with a tag that says how well: only the interval chosen tells.
-                score = 0.8 if schedule.interval_days >= 21 and schedule.lapse_count == 0 else 0.5
-                reason.append(f"{_plural(len(card.answers), 'answer')}, none with an understanding tag")
-            else:
-                # The latest answer weighs most: each older one half as much as the next.
-                weight, total = 1.0, 0.0
-                for value, _ in rated:
-                    score += weight * value
-                    total += weight
-                    weight /= 2
-                score /= total
-                shown = ["+".join(tags) for _, tags in rated[:3]]
-                reason.append(f"last answer: {shown[0]}" if len(rated) == 1 else f"last {len(shown)} answers: {', '.join(shown)}")
-            if schedule.lapse_count > 0:
-                score -= 0.1 * min(schedule.lapse_count, 3)
-            if schedule.interval_days >= 30:
-                score += 0.1
-            # Long past due: it may have faded since.
-            if overdue > max(7, schedule.interval_days):
-                score -= 0.15
-            level = "solid" if score >= 0.75 else "shaky" if score >= 0.4 else "unknown"
-            if schedule.retained:
-                reason.append("never asked again")
-            elif schedule.interval_days > 0:
-                reason.append(f"interval {days_text(schedule.interval_days)}")
-            if schedule.lapse_count > 0:
-                reason.append(_plural(schedule.lapse_count, "lapse"))
-        if overdue > 0:
-            reason.append(f"overdue {overdue} d")
-        if card.retired:
-            reason.append("retired")
-        item = {"card_id": card.id, "question": card.question, "document": entry.document_name, "reason": "; ".join(reason)}
+        card = entry.card
+        assessment = assess(card, level_of, now)
+        item = {"card_id": card.id, "question": card.question, "document": entry.document_name, "reason": "; ".join(assessment.reason)}
+        if assessment.own_idea:
+            item["own_idea"] = True
+            own_ideas.append(short_question(card.question))
         if entry.project:
             item["project"] = entry.project
-        by_class[level].append(item)
-        questions[level].append(short_question(card.question))
+        card_signals = signals_of(card, groups)
+        topic_calibration.add(card_signals, assessment.level, short_question(card.question), groups)
+        if card_signals:
+            item["signals"] = {group: joined_signals(card_signals, group) for group in groups.order
+                               if joined_signals(card_signals, group)}
+            topic_signals.add(card_signals)
+        by_class[assessment.level].append(item)
+        questions[assessment.level].append(short_question(card.question))
 
     if not entries:
-        summary = [f'No review cards match "{topic}": there is no record of what the user knows about it.']
+        summary = [f'No {"knowledge" if projects_matched else "review"} cards match "{topic}": there is no record of '
+                   "what the user knows about it."]
     else:
         n = {name: len(by_class[name]) for name in CLASSES}
         summary = [f'"{topic}": {len(entries)} matching review card{"" if len(entries) == 1 else "s"}: {n["solid"]} solid, '
@@ -1282,15 +1656,45 @@ async def knowledge_profile(thoughts, *, topic: str, project: str | None = None,
         for name, label in (("solid", "Solid"), ("shaky", "Shaky"), ("unknown", "Not understood"), ("unreviewed", "Not yet reviewed")):
             shown = questions[name]
             if shown:
-                summary.append(f"{label}: " + "; ".join(shown[:3]) + (f" (+{len(shown) - 3} more)" if len(shown) > 3 else ""))
+                summary.append(f"{label}: " + "; ".join(shown[:SUMMARY_LIST_LIMIT])
+                               + (f" (+{len(shown) - SUMMARY_LIST_LIMIT} more)" if len(shown) > SUMMARY_LIST_LIMIT else ""))
+        if own_ideas:
+            summary.append("The user's own ideas (they came up with them; build on them, don't explain them back): "
+                           + "; ".join(own_ideas[:SUMMARY_LIST_LIMIT])
+                           + (f" (+{len(own_ideas) - SUMMARY_LIST_LIMIT} more)" if len(own_ideas) > SUMMARY_LIST_LIMIT else ""))
+        summary += topic_signals.lines(groups)
+        summary += topic_calibration.lines(SUMMARY_LIST_LIMIT)
+    if projects_matched:
+        shown = [short_question(entry.card.question) for entry in projects_matched]
+        summary.append("Project cards on this topic (work in progress, not what the user knows): "
+                       + "; ".join(shown[:SUMMARY_LIST_LIMIT])
+                       + (f" (+{len(shown) - SUMMARY_LIST_LIMIT} more)" if len(shown) > SUMMARY_LIST_LIMIT else ""))
     mapping_info = {"source": level_source, "levels": mapping}
     if unmapped:
         mapping_info["unmapped_understanding_tags"] = unmapped
     result = {"schema_version": 1, "accepted": True, "topic": topic, "matched": matched,
-              "counts": {name: len(by_class[name]) for name in CLASSES}, "cards": by_class, "summary": "\n".join(summary),
+              "counts": {name: len(by_class[name]) for name in CLASSES}, "cards": by_class,
               # No index on the server: the server's projections are read live (cached for 30 s).
               "index": {"indexed_at": None, "tag_groups_available": True, "cards": len(library.cards)},
               "mapping": mapping_info}
+    if topic_calibration.total() > 0:
+        result["calibration"] = topic_calibration.json()
+    if projects_matched:
+        result["project_cards"] = {"count": len(projects_matched), "cards": [
+            {"card_id": entry.card.id, "question": entry.card.question, "document": entry.document_name,
+             **({"project": entry.project} if entry.project else {})}
+            for entry in projects_matched[:PROJECT_CARDS_LIMIT]]}
+    # Cold start: when few cards cover the topic, what all the cards say about the user as a
+    # learner, so an explanation of something new can still build on what they know and like.
+    if (matched < 3) if learner is None else learner:
+        every, _ = find_cards(library, "", "")
+        every = [entry for entry in every if not is_project_card(entry.card, library.projects, kinds)]
+        result["learner"], learner_lines = learner_overview(library, rank(every, [], now), level_of, groups, now)
+        if learner_lines:
+            summary.append("Use what the cards say about the user in general instead:" if not entries
+                           else "What the cards say about the user in general:")
+            summary += learner_lines
+    result["summary"] = "\n".join(summary)
     if project:
         result["project"] = project
     if document:

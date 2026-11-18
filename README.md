@@ -13,17 +13,26 @@ By **Tommaso Bendinelli**.
 ## What it can do
 
 Tools: `list_documents` (with each PDF's Library filename), `read_document` (LaTeX with `\input`
-files inlined, Markdown, or PDF text), `search_library`, `document_feedback`, `review_cards` /
-`get_review_card`, `knowledge_profile` (which cards on a topic are solid, shaky, unknown or
-unreviewed), `link_conversation`, `list_notes`, `get_note` (with the user's replies, their drawings
+files inlined, Markdown, or PDF text), `search_library`, `document_feedback` (likes, dislikes and
+questions; a question asks for an answer, not an edit), `review_cards` / `get_review_card` (with
+each card's kind: a knowledge card, material the user studies, or a project card, about work in
+progress; `review_cards` filters by `kind`), `knowledge_profile` (which knowledge cards on a topic
+are solid, shaky, unknown or unreviewed, each card's signals from the user's other tag groups such
+as Interest and Effort, calibration against a Confidence slider, what all the cards say about the
+user as a learner when few match, and matching project cards listed apart), `mental_model` (the
+user's Mental Model, the Library note `mental-model.md`), `link_conversation`, `list_notes`, `get_note` (with the user's replies, their drawings
 and the photo sent with a reply), `send_note` (Markdown with math rendered to a phone-width PNG; its
 links become tappable areas of the picture that open a web page or a page of a Library PDF),
 `note_rules`, `own_topic` / `release_topic`, `add_diary_entry`, `read_source`,
 `create_proposals` / `revise_proposal` / `remove_proposal`, `source_conflicts` /
-`read_source_conflict` / `resolve_source_conflict`, `create_document`, `create_review_card` /
+`read_source_conflict` / `resolve_source_conflict`, `create_document`, `create_review_card` (a
+card whose answer is a passage of a note, or a whole section named by its heading with
+`section_line` or `section_heading`; `kind` chooses a knowledge or project card) /
 `move_review_card` (a card linked to source markers moves with its marked passage as two linked
 pending proposals that the user accepts or rejects as one), `merge_review_cards` (cards of one
-document merged into one, when the user asks), `pending_card_moves` / `cancel_pending_card_move` (a
+document, or of one imported PDF, merged into one, when the user asks), `create_project` /
+`add_source_folder` (a Project with a docs folder of its own) and `move_note` (a note of a docs
+folder moved to another Project with its review cards, comments, links and interactive pages), `pending_card_moves` / `cancel_pending_card_move` (a
 card moved onto the text of a pending proposal waits until the user accepts that proposal),
 `html_pages` / `add_html_page`, `build_status`, `move_pdf`, `import_pdf` (the server downloads a PDF
 from a URL into a Project).
@@ -45,7 +54,8 @@ it. What no running agent covers is left to a responder agent, if the server's o
 The connector talks to the Thoughts server as its own device (`connector`), and every request goes
 through an allowlist in `thoughts_connector.py` (`check_request`): it reads the Library, creates
 agent notes, diary entries and conversation links, claims replies, registers and ends topic owners,
-reads the answering rules, publishes sources into which thoughts-cli wrote *pending* proposals, and
+reads the answering rules and the Mental Model, publishes sources into which thoughts-cli wrote
+*pending* proposals, creates Projects, gives them docs folders and moves notes between them, and
 asks the server for a PDF import by URL, a merge of review cards or a pending card move. It never
 accepts or rejects a proposal and never reviews or retires a card; cards are deleted only by the
 server, as part of a merge the user asked for. It refuses every other Library-project action.
@@ -70,6 +80,11 @@ server, as part of a merge the user asked for. It refuses every other Library-pr
 - Links in notes need `agent_note_links_v1` (otherwise the note is sent without them, with a
   warning); claims, topic owners and answering rules need `agent_note_claims_v1`,
   `agent_note_owners_v1` and `agent_note_rules_v1`.
+- Merging cards of an imported PDF needs `review_card_merge_pdf_v1` and thoughts-cli 1.8.0;
+  `create_project`, `add_source_folder` and `move_note` need `library_project_source_folder_v1`
+  and thoughts-cli 1.9.0; card kinds need thoughts-cli 1.10.0 (without it every card counts as
+  knowledge and no kind is shown); section cards need thoughts-cli 1.11.0; `mental_model` needs
+  `mental_model_v1`.
 
 ## Configuration
 

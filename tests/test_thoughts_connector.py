@@ -163,14 +163,16 @@ URL_IMPORTS: list[dict] = []  # bodies of POST /v1/library/url-imports
 OPERATIONS: list[dict] = []  # thoughts-cli's review-card operations
 CAPABILITIES = ["client_review_sources_v1", "client_review_source_replacement_v1", "client_review_card_move_v1",
                 "library_import_pdf_v1", "review_card_merge_v1", "review_card_pending_moves_v1", "agent_note_links_v1",
-                "review_card_move_pairs_v1",
-                "agent_note_claims_v1", "agent_note_owners_v1", "agent_note_rules_v1"]
+                "review_card_move_pairs_v1", "review_card_merge_pdf_v1",
+                "agent_note_claims_v1", "agent_note_owners_v1", "agent_note_rules_v1", "mental_model_v1",
+                "library_project_source_folder_v1"]
 # Who answers: claims (path, body), how the fake answers each item, topic owners posted, deletions.
 CLAIMS: list[tuple[str, dict]] = []
 CLAIM_OUTCOMES: dict[str, str] = {}  # item id -> "yours" (default), "responder", "not_covering"
 OWNERS_POSTED: list[dict] = []
 DELETES: list[tuple[str, dict]] = []
 RULES_TEXT = "# Answering rules\nAnswer in plain words.\n"
+MENTAL_MODEL_TEXT = "# Mental Model\n\n## Firm ground to build on\n\nSorting [0190a00c](thoughts-card:0190a00c-0000-7000-8000-00000000000c).\n"
 CLAIM_NOTE = "3c4d5e6f-7a8b-4c9d-8e0f-1a2b3c4d5e6f"
 CLAIM_REPLY = "4d5e6f7a-8b9c-4d0e-9f1a-2b3c4d5e6f7a"
 CLAIM_PAGE = "5e6f7a8b-9c0d-4e1f-8a2b-3c4d5e6f7a8b"
@@ -205,6 +207,39 @@ PHOTO_NOTE_RECORD = {"note_id": PHOTO_NOTE, "title": "Sketch", "message": None, 
                                   "sources": "linked_pdf",
                                   "photo": {"url": "/v1/agent-notes/replies/r2/photo", "media_type": "image/jpeg",
                                             "capture": "IMG_20261111_170138_123_ab12"}}]}
+
+
+def fake_folder(project: dict, label: str, operation_id: str) -> str:
+    """A docs folder of the Project's own, as the server's add_source_folder names and lists it."""
+    folder = "docs-" + label.lower().replace(" ", "-") + "-" + operation_id.replace("-", "")[:6]
+    project["project_configuration"]["source_folders"].append(
+        {"folder_id": "f-" + folder, "path": folder, "document_id": operation_id})
+    project.setdefault("source_folders", []).append({"project": folder, "folder": label})
+    return folder
+
+
+def fake_plan(origin: dict, body: dict) -> dict:
+    """What plan_move_source_document answers for a note of origin's docs folder."""
+    document = next(d for d in origin["documents"] if d["document_id"] == body["document_id"])
+    destination = next(p for p in PROJECTS["projects"] if p["id"] == body["destination_project_id"])
+    configuration = destination["project_configuration"]
+    folders = [f["path"] for f in configuration["source_folders"] if f["folder_id"] != configuration["default_folder_id"]]
+    folder = folders[0] if folders else "docs-" + destination["name"].lower() + "-faf6e6"
+    relative = document["source_file"][len(document["source_project"]) + 1:]
+    page = "tex/support/html/explainer.html"
+    return {"action": "move_source_document", "document_id": document["document_id"], "name": document["name"],
+            "source": {"project_id": origin["id"], "project_name": origin["name"], "folder": document["source_project"],
+                       "path": relative, "revision": origin["revision"]},
+            "destination": {"project_id": destination["id"], "project_name": destination["name"], "folder": folder,
+                            "path": body.get("destination_path") or relative, "revision": destination["revision"],
+                            "collision": False, "suggested_path": None,
+                            **({} if folders else {"new_folder": True, "folder_name": destination["name"]})},
+            "files": [{"source": "tex/support/manual_style.sty", "destination": "tex/support/manual_style.sty",
+                       "action": "copy", "transfer": "fedora", "reason": "the new folder has no project style yet"}],
+            "link_edits": {document["source_file"]: [], document["source_project"] + "/tex/source/matrices.tex": []},
+            "html_pages": [{"source": document["source_project"] + "/" + page, "destination": folder + "/" + page,
+                            "sha256": "e" * 64, "bytes": 10}],
+            "markers": {"review_cards": 1}, "warnings": [], "plan_digest": "digest-" + folder}
 
 
 class FakeThoughts(BaseHTTPRequestHandler):
@@ -273,7 +308,23 @@ class FakeThoughts(BaseHTTPRequestHandler):
         if method == "POST" and path == "/v1/library/projects":
             body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
             LIBRARY_CHANGES.append(body)
+            if body["action"] == "create":
+                # As the server: new:<id> with its default folder, and its own docs folder when asked.
+                if any(p["name"].casefold() == body["name"].casefold() for p in PROJECTS["projects"]):
+                    return self.reply(409, {"detail": "A project with this name already exists"})
+                default = {"folder_id": "default-" + body["project_id"], "path": ".thoughts/projects/x/default",
+                           "document_id": body["operation_id"]}
+                created = {"id": body["project_id"], "name": body["name"], "revision": 1, "documents": [],
+                           "unpublished_documents": [], "source_folders": [], "project_configuration": {
+                               "id": body["project_id"], "name": body["name"], "default_folder_id": default["folder_id"],
+                               "document_names": {}, "source_folders": [default], "documents": [], "rendering": {}}}
+                if "source_folder" in body:
+                    fake_folder(created, body["source_folder"] or body["name"], body["operation_id"])
+                PROJECTS["projects"].append(created)
+                return self.reply(200, PROJECTS)
             project = next(p for p in PROJECTS["projects"] if p["id"] == body["project_id"])
+            if body["action"] == "plan_move_source_document":
+                return self.reply(200, {"plan": fake_plan(project, body)})
             if body["base_revision"] != project.setdefault("revision", 0):
                 return self.reply(409, {"detail": "This project changed on another device. Sync and try again"})
             if body["action"] == "include_source":
@@ -311,6 +362,24 @@ class FakeThoughts(BaseHTTPRequestHandler):
                         listed.remove(document)
                 destination.setdefault("unpublished_documents" if not document.get("included", True) else "documents",
                                        []).append(document)
+                destination["revision"] += 1
+            elif body["action"] == "add_source_folder":
+                labels = [f["folder"] for f in project.get("source_folders", [])]
+                if (body.get("name") or project["name"]) in labels:
+                    return self.reply(409, {"detail": "Another source folder in this project already has this name"})
+                fake_folder(project, body.get("name") or project["name"], body["operation_id"])
+            elif body["action"] == "move_source_document":
+                plan = fake_plan(project, body)
+                destination = next(p for p in PROJECTS["projects"] if p["id"] == body["destination_project_id"])
+                if body["plan_digest"] != plan["plan_digest"] or body["destination_revision"] != destination["revision"]:
+                    return self.reply(409, {"detail": "The files this move needs changed after you reviewed it."})
+                if plan["destination"].get("new_folder"):
+                    fake_folder(destination, destination["name"], "faf6e6")
+                document = next(d for d in project["documents"] if d["document_id"] == body["document_id"])
+                project["documents"].remove(document)
+                destination["documents"].append({**document, "source_project": plan["destination"]["folder"],
+                                                 "source_file": plan["destination"]["folder"] + "/"
+                                                 + plan["destination"]["path"]})
                 destination["revision"] += 1
             else:
                 return self.reply(409, {"detail": "Unsupported project action"})
@@ -363,6 +432,17 @@ class FakeThoughts(BaseHTTPRequestHandler):
                     return self.reply(409, {"accepted": False, "error_code": "request_conflict",
                                             "detail": "This request ID was already used with different arguments."})
                 return self.reply(200, {**answer, "replayed": True})
+            if "source" not in body:  # cards of an imported PDF
+                kept = body.get("keep_card_id", body["card_ids"][0])
+                answer = {"schema_version": 1, "accepted": True, "terminal": True, "state": "merged", "kind": "pdf",
+                          "request_id": body["request_id"], "kept_card_id": kept,
+                          "deleted_card_ids": [c for c in body["card_ids"] if c != kept],
+                          "delete_event_ids": ["e-" + c[:8] for c in body["card_ids"] if c != kept],
+                          "card_order": body["card_ids"], "question": body.get("question", "Joined?"),
+                          "source": None, "source_sha256": None, "passages": 2 * len(body["card_ids"]),
+                          "card_revision": 2, "document": "scan.pdf", "replayed": False, "message": "Merged."}
+                MERGE_RECEIPTS[body["request_id"]] = (body, answer)
+                return self.reply(200, answer)
             current = next(s for s in SOURCES if s["path"] == body["source"])["sha256"]
             if body["expected_source_sha256"] != current:
                 return self.reply(409, {"accepted": False, "error_code": "source_conflict", "current_source_sha256": current,
@@ -433,6 +513,10 @@ class FakeThoughts(BaseHTTPRequestHandler):
                                         "claim": {"device_id": "server", "conversation_id": "s", "role": "responder"}})
             return self.reply(409, {"claimed": False, "error_code": "agent_note_not_covering", "detail": "no",
                                     "claim": None})
+        if method == "GET" and path == "/v1/mental-model":
+            return self.reply(200, {"text": MENTAL_MODEL_TEXT, "sha256": "m", "revision": 3, "others": [],
+                                    "source_path": ".thoughts/projects/p/default/mental-model.md",
+                                    "updated_at": "2026-11-16T10:45:00Z"})
         if method == "GET" and path == "/v1/agent-notes/rules":
             return self.reply(200, {"text": RULES_TEXT, "sha256": "r", "source_path": "docs-x/agent-note-rules.md",
                                     "revision": 2, "updated_at": "2026-01-05T09:00:00Z", "others": []})
@@ -599,10 +683,11 @@ def test_tools_and_annotations(token):
     writers = {"send_note", "add_diary_entry", "create_proposals", "revise_proposal", "remove_proposal",
                "link_conversation", "create_document", "create_review_card", "move_review_card", "resolve_source_conflict",
                "add_html_page", "move_pdf", "import_pdf", "merge_review_cards", "cancel_pending_card_move",
-               "own_topic", "release_topic"}
+               "own_topic", "release_topic", "create_project", "add_source_folder", "move_note"}
     assert set(tools) == {"list_documents", "read_document", "read_source", "search_library", "review_cards",
                           "get_review_card", "list_notes", "get_note", "document_feedback", "knowledge_profile", "source_conflicts",
-                          "read_source_conflict", "html_pages", "build_status", "pending_card_moves", "note_rules"} | writers
+                          "read_source_conflict", "html_pages", "build_status", "pending_card_moves", "note_rules",
+                          "mental_model"} | writers
     assert all(not tools[name]["annotations"]["readOnlyHint"] for name in writers)
     assert all(t["annotations"]["readOnlyHint"] for name, t in tools.items() if name not in writers)
     edit = tools["create_proposals"]["inputSchema"]
@@ -622,6 +707,15 @@ def test_tools_and_annotations(token):
             assert phrase in tools[name]["description"], (name, phrase)
     assert "Only reads" in tools["build_status"]["description"]
     assert set(tools["move_pdf"]["inputSchema"]["required"]) == {"pdf", "project", "request_id"}
+    assert set(tools["create_project"]["inputSchema"]["required"]) == {"name", "request_id"}
+    assert set(tools["create_project"]["inputSchema"]["properties"]) == {"name", "request_id", "source_folder",
+                                                                        "folder_name"}
+    assert set(tools["add_source_folder"]["inputSchema"]["required"]) == {"project", "request_id"}
+    move = tools["move_note"]
+    assert set(move["inputSchema"]["required"]) == {"document", "project", "request_id"}
+    for phrase in ("review cards and comments follow", "interactive pages", "needs_mac", "dry_run",
+                   "\\SourceLink <-> \\CrossSourceLink"):
+        assert phrase in move["description"], phrase
     imports = tools["import_pdf"]
     assert set(imports["inputSchema"]["required"]) == {"project", "name", "url"}
     assert set(imports["inputSchema"]["properties"]) == {"project", "name", "url"}
@@ -630,13 +724,14 @@ def test_tools_and_annotations(token):
         assert phrase in imports["description"], phrase
     merge = tools["merge_review_cards"]
     schema = merge["inputSchema"]
-    assert set(schema["required"]) == {"card_ids", "source", "expected_source_sha256", "request_id"}
+    assert set(schema["required"]) == {"card_ids", "request_id"}
     assert set(schema["properties"]) == {"card_ids", "source", "expected_source_sha256", "request_id", "keep_card_id",
                                          "question"}
     assert (schema["properties"]["card_ids"]["minItems"], schema["properties"]["card_ids"]["maxItems"]) == (2, 20)
     assert merge["annotations"]["destructiveHint"] and merge["annotations"]["idempotentHint"]
     for phrase in ("as Merge cards… in the Thoughts app does", "keeps its ID, schedule and review history",
-                   "Use it only when the user asked", "nothing for the user to accept piece by piece"):
+                   "Use it only when the user asked", "nothing for the user to accept piece by piece",
+                   "Cards of an imported PDF", "leave out source"):
         assert phrase in merge["description"], phrase
 
 
@@ -842,6 +937,13 @@ def test_get_note_claims_for_the_conversation_and_hands_over_the_rules(token):
     assert CLAIMS[-1][0] == f"/v1/agent-notes/handling/{CLAIM_PAGE}/claim"
     assert page["structuredContent"]["page_handling"]["state"] == "not_yours"
     assert "This page: not yours" in page["content"][0]["text"]
+
+
+def test_the_mental_model_is_the_library_note(token):
+    page = call(token, "mental_model")
+    assert page["content"][0]["text"] == MENTAL_MODEL_TEXT
+    assert page["structuredContent"]["source_path"] == ".thoughts/projects/p/default/mental-model.md"
+    assert page["structuredContent"]["revision"] == 3
 
 
 def test_note_rules_and_topic_owners(token):
@@ -1102,6 +1204,8 @@ def test_only_the_new_note_actions_change_a_project(server):
     thoughts_connector.check_request("POST", "/v1/library/projects", {"action": "rename_document"})
     thoughts_connector.check_request("GET", "/v1/library/projects")
     thoughts_connector.check_request("POST", "/v1/library/projects", {"action": "move_document"})
+    for action in ("create", "add_source_folder", "plan_move_source_document", "move_source_document"):
+        thoughts_connector.check_request("POST", "/v1/library/projects", {"action": action})
     for method, route in (("GET", "/v1/render-status"), ("GET", f"/v1/builds/{CARD}"),
                           ("GET", f"/v1/builds/{CARD}/source-diff")):
         thoughts_connector.check_request(method, route)
@@ -1157,6 +1261,43 @@ def test_create_review_card_marks_the_passage_in_one_operation(token):
         "start_line": 3, "end_line": 4, "request_id": "c7b6c5b7-1d2a-4c3b-9f8e-112233445566"}})
     assert moved["isError"] and moved["structuredContent"]["error_code"] == "card_unavailable"
     assert len(OPERATIONS) == 1
+
+
+SECTION_CLI = HAVE_CLI and (CLI / "thoughts_cli" / "review_card_sections.py").is_file()
+
+
+@pytest.mark.skipif(not SECTION_CLI, reason="thoughts-cli with section cards not found")
+def test_create_review_card_of_a_whole_section(token):
+    source = call(token, "read_source", source="docs-ideas/markdown/source/ideas.md")["structuredContent"]
+    request_id = "d5b6c5b7-1d2a-4c3b-9f8e-112233445566"
+    arguments = dict(source=source["source"], expected_source_sha256=source["source_sha256"], section_heading="Ideas",
+                     question="What is the section about?", due_at="2099-01-01T09:00:00+01:00", request_id=request_id)
+    sent = len(OPERATIONS)
+    created = call(token, "create_review_card", **arguments)
+    assert len(OPERATIONS) == sent + 1
+    operation = OPERATIONS[-1]
+    key = f"review:{request_id}:answer:0"
+    # The heading stays outside; the section's body is the card's answer.
+    assert OBJECTS[operation["payload"]["source_change"]["after_sha256"]].decode() == (
+        f"# Ideas\n\n<!-- thoughts:v1:start {key} -->\nA note about two techniques.\n"
+        f"<!-- thoughts:v1:end {key} -->\n")
+    section = created["structuredContent"]["section"]
+    assert (section["title"], section["kind"], section["heading_line"], section["start_line"]) == ("Ideas", "section", 1, 3)
+    assert "It hides the section “Ideas” (lines 3–3 before the markers)" in created["content"][0]["text"]
+    # A passage and a section at once, or neither: refused before thoughts-cli is asked.
+    for extra in ({"start_line": 3, "end_line": 4}, {"section_line": 1}):
+        refused = rpc(token, "tools/call", {"name": "create_review_card", "arguments": {
+            **arguments, **extra, "request_id": "d6b6c5b7-1d2a-4c3b-9f8e-112233445566"}})
+        assert refused["isError"] and refused["structuredContent"]["error_code"] == "invalid_request"
+    neither = {key: value for key, value in arguments.items() if key != "section_heading"}
+    refused = rpc(token, "tools/call", {"name": "create_review_card", "arguments": {
+        **neither, "request_id": "d7b6c5b7-1d2a-4c3b-9f8e-112233445566"}})
+    assert refused["isError"] and refused["structuredContent"]["error_code"] == "invalid_request"
+    # Not a heading: thoughts-cli refuses, nothing is sent.
+    refused = rpc(token, "tools/call", {"name": "create_review_card", "arguments": {
+        **neither, "section_line": 3, "request_id": "d8b6c5b7-1d2a-4c3b-9f8e-112233445566"}})
+    assert refused["isError"] and refused["structuredContent"]["error_code"] == "invalid_selection"
+    assert len(OPERATIONS) == sent + 1
 
 
 MERGE_CLI = HAVE_CLI and (CLI / "thoughts_cli" / "card_merges.py").is_file()
@@ -1242,6 +1383,61 @@ def test_merge_review_cards_needs_a_thoughts_cli_that_merges(token, monkeypatch)
     assert refused["isError"] and refused["structuredContent"]["error_code"] == "not_supported"
     assert "thoughts-cli" in refused["content"][0]["text"] and len(MERGES) == before
 
+
+PDF_MERGE_CLI = MERGE_CLI and "is_pdf_merge" in (CLI / "thoughts_cli" / "card_merges.py").read_text()
+PDF_ONE = "77777777-7777-4777-8777-777777777777"
+PDF_TWO = "88888888-8888-4888-8888-888888888888"
+
+
+@pytest.mark.skipif(not PDF_MERGE_CLI, reason="thoughts-cli that merges cards of a PDF (1.8.0) not found")
+def test_merge_review_cards_of_a_pdf_sends_no_source(token):
+    arguments = dict(card_ids=[PDF_ONE, PDF_TWO], request_id="e9b6c5b7-1d2a-4c3b-9f8e-112233445566",
+                     keep_card_id=PDF_TWO)
+    before = len(REQUESTS)
+    merged = call(token, "merge_review_cards", **arguments)
+    assert MERGES[-1] == arguments
+    body = merged["structuredContent"]
+    assert body["kind"] == "pdf" and body["kept_card_id"] == PDF_TWO and body["deleted_card_ids"] == [PDF_ONE]
+    assert "render_check" not in body
+    text = merged["content"][0]["text"]
+    assert f"Merged 2 cards of scan.pdf into card {PDF_TWO}" in text and "4 area(s) on the PDF" in text
+    assert f"Deleted: {PDF_ONE}" in text and "nothing in the PDF changed" in text and "next Sync" in text
+    sent = [(method, path) for method, path, _auth in REQUESTS[before:]]
+    # Nothing to build: the cards keep their areas.
+    assert sent.count(("POST", "/v1/review-card-merges")) == 1 and ("POST", "/v1/render-checks") not in sent
+    replay = call(token, "merge_review_cards", **arguments)
+    assert replay["structuredContent"]["replayed"] is True and "replayed" in replay["content"][0]["text"]
+
+
+def test_merge_review_cards_needs_both_source_fields_or_neither(token):
+    before = len(MERGES)
+    for extra in ({"source": RESULTS_PATH}, {"expected_source_sha256": RESULTS[0]}):
+        refused = rpc(token, "tools/call", {"name": "merge_review_cards", "arguments": {
+            "card_ids": [PDF_ONE, PDF_TWO], "request_id": str(uuid.uuid4()), **extra}})
+        assert refused["isError"] and refused["structuredContent"]["error_code"] == "invalid_request"
+        assert "leave both out" in refused["content"][0]["text"]
+    assert len(MERGES) == before
+
+
+def test_merge_review_cards_of_a_pdf_needs_the_server_and_thoughts_cli_to_support_it(server, token, monkeypatch):
+    arguments = {"card_ids": [PDF_ONE, PDF_TWO], "request_id": "eab6c5b7-1d2a-4c3b-9f8e-112233445566"}
+    before = len(MERGES)
+    CAPABILITIES.remove("review_card_merge_pdf_v1")
+    server.thoughts.cached.pop("health", None)
+    try:
+        refused = rpc(token, "tools/call", {"name": "merge_review_cards", "arguments": arguments})
+        assert refused["isError"] and refused["structuredContent"]["error_code"] == "not_supported"
+        assert "review_card_merge_pdf_v1" in refused["content"][0]["text"]
+    finally:
+        CAPABILITIES.append("review_card_merge_pdf_v1")
+        server.thoughts.cached.pop("health", None)
+    from types import SimpleNamespace
+    older_cli = SimpleNamespace(client=SimpleNamespace(COMMANDS=("merge-review-cards",)),
+                                card_merges=SimpleNamespace(CAPABILITY="review_card_merge_v1"))
+    monkeypatch.setattr(thoughts_connector, "load_thoughts_cli", lambda: older_cli)
+    refused = rpc(token, "tools/call", {"name": "merge_review_cards", "arguments": arguments})
+    assert refused["isError"] and refused["structuredContent"]["error_code"] == "not_supported"
+    assert "thoughts-cli 1.8.0" in refused["content"][0]["text"] and len(MERGES) == before
 
 PENDING_CLI = HAVE_CLI and (CLI / "thoughts_cli" / "card_pending_moves.py").is_file()
 PENDING_PID = "agent-5e0b6f7a-1c2d-4e3f-8a9b-0c1d2e3f4a5b"
@@ -1346,6 +1542,9 @@ def test_knowledge_profile_is_wired_and_read_only(token):
     before = len(REQUESTS)
     profile = call(token, "knowledge_profile", topic="current results")["structuredContent"]
     assert profile["accepted"] and profile["topic"] == "current results"
+    # learner reaches the profile: with it, what all the cards say about the user; without, as few cards match.
+    assert "learner" in call(token, "knowledge_profile", topic="current results", learner=True)["structuredContent"]
+    assert "learner" not in call(token, "knowledge_profile", topic="current results", learner=False)["structuredContent"]
     assert all(method == "GET" for method, _path, _auth in REQUESTS[before:])
 
 
@@ -1413,7 +1612,7 @@ def test_merge_is_resolved_without_the_user(token):
 @pytest.mark.skipif(not (HAVE_CLI and (CLI / "thoughts_cli" / "html_pages.py").is_file()),
                     reason="thoughts-cli with HTML pages not found")
 def test_an_html_page_is_added_and_then_linked_from_a_note(token):
-    page = "docs-rp/tex/support/html/irt-middle-slope.html"
+    page = "docs-rp/tex/support/html/slope-explorer.html"
     html = "<!doctype html><title>Curve</title><input type=range>"
     conversation = "0b6c5b7e-1d2a-4c3b-9f8e-112233445566"
     source = call(token, "read_source", source="docs-rp/tex/fragments/results.tex")["structuredContent"]
@@ -1426,7 +1625,7 @@ def test_an_html_page_is_added_and_then_linked_from_a_note(token):
     assert missing["isError"] and missing["structuredContent"]["error_code"] == "invalid_link"
     assert missing["structuredContent"]["links"][0]["reason"] == "html_page_not_found"
     published = len(PUBLISHED)
-    saved = call(token, "add_html_page", folder="docs-rp/tex/fragments/results.tex", name="irt-middle-slope", html=html,
+    saved = call(token, "add_html_page", folder="docs-rp/tex/fragments/results.tex", name="slope-explorer", html=html,
                  request_id="6c6c5b7e-1d2a-4c3b-9f8e-112233445566")
     body = saved["structuredContent"]
     assert body["path"] == page and body["link"] == "thoughts-html:" + page and len(PUBLISHED) == published
@@ -1436,9 +1635,9 @@ def test_an_html_page_is_added_and_then_linked_from_a_note(token):
     listed = call(token, "html_pages", folder="docs-rp", path=page)["structuredContent"]
     assert [p["path"] for p in listed["pages"]] == [page] and listed["html"] == html
     exists = rpc(token, "tools/call", {"name": "add_html_page", "arguments": {
-        "folder": "docs-rp", "name": "irt-middle-slope", "html": html + "<p>2", "request_id": "7c6c5b7e-1d2a-4c3b-9f8e-112233445566"}})
+        "folder": "docs-rp", "name": "slope-explorer", "html": html + "<p>2", "request_id": "7c6c5b7e-1d2a-4c3b-9f8e-112233445566"}})
     assert exists["isError"] and exists["structuredContent"]["error_code"] == "html_page_exists"
-    replaced = call(token, "add_html_page", folder="docs-rp", name="irt-middle-slope", html=html + "<p>2", replace=True,
+    replaced = call(token, "add_html_page", folder="docs-rp", name="slope-explorer", html=html + "<p>2", replace=True,
                     request_id="8c6c5b7e-1d2a-4c3b-9f8e-112233445566")["structuredContent"]
     assert replaced["replaced"] is True and HTML_CHANGES[-1]["changes"][0]["base_sha256"] == body["sha256"]
     created = call(token, "create_proposals", source=source["source"], expected_source_sha256=source["source_sha256"],
@@ -1492,6 +1691,71 @@ def test_move_pdf_moves_an_imported_pdf_and_back(token):
     refused = rpc(token, "tools/call", {"name": "move_pdf", "arguments": {
         "pdf": "hidden.pdf", "project": "Research", "request_id": "d3b6c5b7-1d2a-4c3b-9f8e-112233445566"}})
     assert refused["isError"] and "no_change" in refused["content"][0]["text"]
+
+
+def test_a_project_of_its_own_folder_and_a_note_moved_into_it(token):
+    """create_project gives the Project a docs folder; move_note moves a note with its card, links and page."""
+    drafts = {"id": "p9", "name": "Drafts", "revision": 2, "unpublished_documents": [], "documents": [
+        {"document_id": "doc-vectors", "name": "Vectors, briefly", "included": True,
+         "source_file": "docs-drafts/tex/source/vectors.tex", "source_project": "docs-drafts",
+         "sha256": "d" * 64, "page_count": 3}],
+        "source_folders": [{"project": "docs-drafts", "folder": "drafts"}],
+        "project_configuration": {"id": "p9", "name": "Drafts", "default_folder_id": "f9", "document_names": {},
+                                  "source_folders": [{"folder_id": "f9", "path": ".thoughts/projects/c/default"},
+                                                     {"folder_id": "fc", "path": "docs-drafts"}],
+                                  "documents": [], "rendering": {}}}
+    PROJECTS["projects"].append(drafts)
+    count = len(PROJECTS["projects"])
+    try:
+        rid = "e1b6c5b7-1d2a-4c3b-9f8e-112233445566"
+        created = call(token, "create_project", name="algebra", request_id=rid)
+        body = created["structuredContent"]
+        assert body["state"] == "project_created" and body["project_id"] == "new:" + rid
+        assert LIBRARY_CHANGES[-1] == {"action": "create", "operation_id": rid, "project_id": "new:" + rid,
+                                       "name": "algebra", "base_revision": 0, "source_folder": None}
+        [folder] = body["source_folders"]
+        assert folder == {"folder": "docs-algebra-e1b6c5", "name": "algebra"}
+        assert "own folder docs-algebra-e1b6c5" in created["content"][0]["text"]
+        replay = call(token, "create_project", name="algebra", request_id=rid)["structuredContent"]
+        assert replay["replayed"] is True and len(PROJECTS["projects"]) == count + 1
+        taken = rpc(token, "tools/call", {"name": "create_project", "arguments": {
+            "name": "Algebra", "request_id": "e2b6c5b7-1d2a-4c3b-9f8e-112233445566"}})
+        assert taken["isError"] and taken["structuredContent"]["error_code"] == "project_exists"
+
+        planned = call(token, "move_note", document="Vectors, briefly", project="algebra", dry_run=True,
+                       request_id="e3b6c5b7-1d2a-4c3b-9f8e-112233445566")
+        assert planned["structuredContent"]["state"] == "move_planned"
+        assert LIBRARY_CHANGES[-1]["action"] == "plan_move_source_document"
+        assert "docs-algebra-e1b6c5/tex/support/html/explainer.html" in planned["content"][0]["text"]
+        assert drafts["documents"] and drafts["documents"][0]["document_id"] == "doc-vectors"  # nothing moved
+
+        moved = call(token, "move_note", document="doc-vectors", project="algebra",
+                     request_id="e4b6c5b7-1d2a-4c3b-9f8e-112233445566")
+        result = moved["structuredContent"]
+        assert result["state"] == "document_moved", result
+        assert result["to"] == "docs-algebra-e1b6c5/tex/source/vectors.tex" and result["review_card_markers"] == 1
+        sent = LIBRARY_CHANGES[-1]
+        assert sent["action"] == "move_source_document" and sent["plan_digest"] == "digest-docs-algebra-e1b6c5"
+        assert sent["carry_preamble"] is True and sent["destination_path"] == "tex/source/vectors.tex"
+        text = moved["content"][0]["text"]
+        assert "Links rewritten in: docs-drafts/tex/source/matrices.tex" in text
+        assert "Interactive pages listed in the new folder" in text and drafts["documents"] == []
+        algebra = next(p for p in PROJECTS["projects"] if p["name"] == "algebra")
+        assert [d["document_id"] for d in algebra["documents"]] == ["doc-vectors"]
+
+        plain = call(token, "create_project", name="sketches", source_folder=False,
+                     request_id="e5b6c5b7-1d2a-4c3b-9f8e-112233445566")["structuredContent"]
+        assert plain["source_folders"] == [] and "source_folder" not in LIBRARY_CHANGES[-1]
+        added = call(token, "add_source_folder", project="sketches",
+                     request_id="e6b6c5b7-1d2a-4c3b-9f8e-112233445566")["structuredContent"]
+        assert added["state"] == "source_folder_added" and added["folder"].startswith("docs-sketches-")
+        assert LIBRARY_CHANGES[-1]["action"] == "add_source_folder"
+        again = rpc(token, "tools/call", {"name": "add_source_folder", "arguments": {
+            "project": "sketches", "request_id": "e7b6c5b7-1d2a-4c3b-9f8e-112233445566"}})
+        assert again["isError"] and "already has this name" in again["content"][0]["text"]
+        assert {change["action"] for change in LIBRARY_CHANGES} <= thoughts_connector.LIBRARY_ACTIONS
+    finally:
+        PROJECTS["projects"][:] = [p for p in PROJECTS["projects"] if p["id"] in {"p1", "p2", "p3"}]
 
 
 def test_import_pdf_imports_from_a_url_and_a_second_import_is_a_replay(token):
@@ -1736,3 +2000,57 @@ def test_move_review_card_tells_agents_to_move_linked_cards_themselves(token):
     assert "never ask the user to cut and paste it by hand" in " ".join(description.split())
     assert {"explanation", "conversation_id"} <= set(tools["move_review_card"]["inputSchema"]["properties"])
     assert not {"explanation", "conversation_id"} & set(tools["move_review_card"]["inputSchema"].get("required", []))
+
+
+KIND_EVENT = {"entity_type": "review_event", "entity_id": "k1", "deleted": False, "payload": {
+    "schema_version": 3, "event_id": "k1", "card_id": RETIRED, "queue_action": "set_review_kind", "review_kind": "project",
+    "reviewed_at": "2026-11-17T10:00:00Z", "origin_id": "phone"}}
+
+
+@pytest.mark.skipif(not (HAVE_CLI and (CLI / "thoughts_cli" / "review_kinds.py").is_file()),
+                    reason="needs thoughts-cli with review_kinds (thoughts-cli 1.10.0)")
+def test_review_cards_show_and_filter_the_kind(server, token):
+    """thoughts-server protocol/review-card-kinds.md section 8."""
+    every = call(token, "review_cards")["structuredContent"]["cards"]
+    assert {(c["card_id"], c["review_kind"], c["review_kind_source"]) for c in every} == {
+        (CARD, "knowledge", "project"), (RETIRED, "knowledge", "project"), (UNPUBLISHED, "knowledge", "project")}
+    assert all("passage_changed" not in c for c in every)
+    PROJECTIONS["projections"].append(KIND_EVENT)
+    PROJECTS["projects"][0]["review_kind"] = "project"
+    try:
+        server.thoughts.cached.clear()
+        server.thoughts.catalogue = None
+        listed = call(token, "review_cards", kind="project")
+        cards = {c["card_id"]: c for c in listed["structuredContent"]["cards"]}
+        assert set(cards) == {CARD, RETIRED, UNPUBLISHED}
+        assert (cards[RETIRED]["review_kind_source"], cards[CARD]["review_kind_source"]) == ("card", "project")
+        assert cards[CARD]["kind_projects"] == ["Research"] and cards[CARD]["passage_changed"] is False
+        assert ", project card (card" in listed["content"][0]["text"]
+        assert call(token, "review_cards", kind="knowledge")["structuredContent"]["total"] == 0
+        detail = call(token, "get_review_card", card_id=RETIRED)
+        assert detail["structuredContent"]["review_kind"] == "project"
+        assert {"action": "set_review_kind", "review_kind": "project", "reviewed_at": "2026-11-17T10:00:00Z"} in \
+            detail["structuredContent"]["history"]
+        assert "2026-11-17 set_review_kind project" in detail["content"][0]["text"]
+        assert rpc(token, "tools/call", {"name": "review_cards", "arguments": {"kind": "draft"}})["isError"]
+    finally:
+        PROJECTIONS["projections"].remove(KIND_EVENT)
+        del PROJECTS["projects"][0]["review_kind"]
+        server.thoughts.cached.clear()
+        server.thoughts.catalogue = None
+
+
+def test_card_kind_fields_without_review_kinds(monkeypatch):
+    monkeypatch.setattr(thoughts_connector, "review_kinds", lambda: None)
+    assert thoughts_connector.card_kind_fields({"card_id": CARD}, [], []) == {}
+    assert thoughts_connector.kind_text({}) == ""
+    assert thoughts_connector.kind_text({"review_kind": "project", "passage_changed": True}) == \
+        ", project card, passage changed since the last review"
+
+
+def test_create_review_card_passes_the_kind(token):
+    tools = {tool["name"]: tool for tool in rpc(token, "tools/list")["tools"]}
+    schema = tools["create_review_card"]["inputSchema"]["properties"]["kind"]
+    assert {"knowledge", "project"} <= set(json.dumps(schema).replace('"', " ").split())
+    assert "kind" not in tools["create_review_card"]["inputSchema"].get("required", [])
+    assert "kind" in tools["review_cards"]["inputSchema"]["properties"]

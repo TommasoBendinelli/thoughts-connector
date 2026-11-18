@@ -11,7 +11,7 @@
       "interface": {
         "displayName": "Thoughts",
         "shortDescription": "Your Library and review cards",
-        "longDescription": "Read and search your Thoughts Library (LaTeX, Markdown and PDF documents), see your review cards with their answers and how you rated yourself, send a note with math to your phone to draw on and read your reply, propose edits to your notes, create, move and merge review cards, and import a PDF from its URL.",
+        "longDescription": "Read and search your Thoughts Library (LaTeX, Markdown and PDF documents), see your review cards with their answers and how you rated yourself, send a note with math to your phone to draw on and read your reply, propose edits to your notes, create, move and merge review cards, create Projects and move notes between them, and import a PDF from its URL.",
         "developerName": "Tommaso Bendinelli",
         "category": "Productivity",
         "capabilities": [

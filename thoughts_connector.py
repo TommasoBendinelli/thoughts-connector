@@ -23,12 +23,19 @@ resolving source conflicts ("Merge needed") with a version or a combination of v
 and adding or replacing one interactive HTML page of a docs folder (add_html_page: thoughts-cli
 add-html-page uploads it and changes the folder's page list, POST /v1/html-pages; never a removal),
 moving an imported PDF to another Project (move_pdf: the Library-project action move_document),
+creating a Project, with a docs folder of its own unless asked otherwise, and giving a Project one more
+docs folder (create_project, add_source_folder: thoughts-cli create-project and add-source-folder, the
+Library-project actions create and add_source_folder), moving a note of a docs folder to another Project
+with its review cards, comments, figures, links and interactive pages (move_note: thoughts-cli
+move-document, the actions plan_move_source_document and move_source_document, as the Mac's Move to
+project sends them),
 importing a PDF into a Project from a URL (import_pdf: POST /v1/library/url-imports; the server downloads
 it, checks it and makes the Library's Import document change), merging review cards into one when the user
 asks (merge_review_cards: thoughts-cli merge-review-cards, POST /v1/review-card-merges; the server deletes the
 other cards with their markers and gives the kept card every passage, in one transaction, as Merge cards… on
-the Mac does), moving a card onto a pending proposal's text (move_review_card: thoughts-cli asks the server to
-wait for the proposal, POST /v1/review-card-pending-moves; the server moves the card when the user accepts it),
+the Mac does; cards of an imported PDF are merged without source fields and the kept card gets their areas),
+moving a card onto a pending proposal's text (move_review_card: thoughts-cli asks the server to wait for the
+proposal, POST /v1/review-card-pending-moves; the server moves the card when the user accepts it),
 moving a card linked to source markers with its marked passage (move_review_card with start_line equal to
 end_line: thoughts-cli move-card-passage writes two linked pending proposals in one source publication, as the
 Mac's thoughtsctl move-card-passage does; the user decides them as one),
@@ -100,7 +107,7 @@ REPLY_SOURCES = {
                   "links into it. No other Library document, no knowledge profile, no Mental Model. When the note has no "
                   "linked document, use no Thoughts documents.",
     "library": "Use any Library document (search, read, cite with page links) and the knowledge profile, but not the Mental Model.",
-    "library_and_mental_model": "Use the Library, the knowledge profile and the Mental Model, as the answering rules say.",
+    "library_and_mental_model": "Use the Library, the knowledge profile and the Mental Model (mental_model), as the answering rules say.",
 }
 DEFAULT_REPLY_SOURCES = "library_and_mental_model"
 
@@ -168,11 +175,14 @@ ALLOWED = [(method, re.compile(f"^{pattern}$")) for method, pattern in (
     ("DELETE", r"/v1/agent-notes/owners/[0-9a-f]{24}"),
     ("DELETE", r"/v1/agent-notes/owners"),
     ("GET", r"/v1/agent-notes/rules"),
+    ("GET", r"/v1/mental-model"),
 )]
 # Who answers (server capabilities); the reply agent's own MCP server sets the environment defaults below.
 CLAIMS_CAPABILITY = "agent_note_claims_v1"
 OWNERS_CAPABILITY = "agent_note_owners_v1"
 RULES_CAPABILITY = "agent_note_rules_v1"
+# The user's Mental Model, the Library note mental-model.md (GET /v1/mental-model).
+MENTAL_MODEL_CAPABILITY = "mental_model_v1"
 # The conversation this connector process answers for when a tool names none (the reply agent's session).
 DEFAULT_CONVERSATION = os.environ.get("THOUGHTS_AGENT_CONVERSATION", "").strip()
 # Extra origin fields for every note this process sends (the reply agent marks its notes as the responder's).
@@ -186,8 +196,10 @@ RULES_IN_PROMPT = os.environ.get("THOUGHTS_RULES_IN_PROMPT") == "1"
 # The server capability import_pdf needs, and how long its download and import may take.
 IMPORT_CAPABILITY = "library_import_pdf_v1"
 IMPORT_SECONDS = 240
-# The server capability merge_review_cards needs.
+# The server capability merge_review_cards needs, and the one for cards of an imported PDF (no source fields; the
+# thoughts-cli that sends such a request has card_merges.is_pdf_merge, thoughts-cli 1.8.0).
 MERGE_CAPABILITY = "review_card_merge_v1"
+MERGE_PDF_CAPABILITY = "review_card_merge_pdf_v1"
 # The thoughts-cli command that moves a card linked to source markers with its passage (thoughts-cli 1.7.0), and
 # the server capability it needs: the server decides both halves of the move together.
 PASSAGE_MOVE_COMMAND = "move-card-passage"
@@ -208,8 +220,10 @@ LIBRARY_PDF_HREF = re.compile(r"(?:\.\./)*(?:[^/?#]+/)*([A-Za-z0-9][A-Za-z0-9_.-
 OWN_PAGE_HREF = re.compile(r"#page=([0-9]{1,6})", re.I)
 # Operations the connector itself sends: add_diary_entry and link_conversation.
 OWN_OPERATIONS = frozenset({"logical_comment", "agent_conversation"})
-# create_document's three, and move_pdf's move_document (an imported PDF to another Project).
-LIBRARY_ACTIONS = frozenset({"include_source", "rename_document", "set_document_published", "move_document"})
+# create_document's three, move_pdf's move_document (an imported PDF to another Project), create_project's
+# create, add_source_folder's own, and move_note's plan and move (a note of a docs folder to another Project).
+LIBRARY_ACTIONS = frozenset({"include_source", "rename_document", "set_document_published", "move_document",
+                             "create", "add_source_folder", "plan_move_source_document", "move_source_document"})
 MARKER = re.compile(r"(?:<!--\s*)?\\?ReviewCardMask(?:Start|End)\{[^}]*\}\{[^}]*\}%?(?:\s*-->)?")
 INPUT = re.compile(r"\\(?:input|include|subfile)\{([^}]+)\}")
 FOLDER = re.compile(r"docs-[A-Za-z0-9_.-]+")
@@ -274,8 +288,9 @@ def check_request(method: str, route: str, body=None, created: frozenset[str] | 
     action = body.get("action") if isinstance(body, dict) else None
     if action not in LIBRARY_ACTIONS:
         raise ThoughtsError(f"the Library-project action {action!r} is not allowed for the connector "
-                            "(only include_source and rename_document, to add a new note, and move_document, to "
-                            "move an imported PDF)")
+                            "(only include_source and rename_document, to add a new note, move_document, to "
+                            "move an imported PDF, create and add_source_folder, to make a Project or give it a "
+                            "folder, and plan_move_source_document and move_source_document, to move a note)")
     if action == "set_document_published" and (body.get("published") is not False
                                                 or body.get("document_id") not in created):
         raise ThoughtsError("set_document_published is not allowed for the connector, except to unpublish a note "
@@ -663,7 +678,39 @@ def note_links(measured: list, css_height: int, own_pdf: str | None = None,
     return links, warnings
 
 
-def card_summary(card: dict, history: list, docs: dict) -> dict:
+def review_kinds():
+    """thoughts_cli.review_kinds (thoughts-server protocol/review-card-kinds.md), or None with an older thoughts-cli."""
+    try:
+        load_thoughts_cli()
+        import thoughts_cli.review_kinds as kinds
+    except (ImportError, ThoughtsError):
+        return None
+    return kinds
+
+
+def card_kind_fields(card: dict, history: list, projects: list | None) -> dict:
+    """review_kind, review_kind_source, kind_projects and, for a project card, passage_changed."""
+    kinds = review_kinds() if projects is not None else None
+    if kinds is None:
+        return {}
+    kind = kinds.card_kind(card, history, projects)
+    out = {"review_kind": kind.kind, "review_kind_source": kind.source}
+    names = [p.get("name") for p in projects if p.get("id") in kind.project_ids and p.get("name")]
+    if names:
+        out["kind_projects"] = names
+    if kind.is_project:
+        out["passage_changed"] = kinds.passage_changed(card, history)
+    return out
+
+
+def kind_text(summary: dict) -> str:
+    """", project card" (", changed since last review") for a listing line; nothing for a knowledge card."""
+    if summary.get("review_kind") != "project":
+        return ""
+    return ", project card" + (", passage changed since the last review" if summary.get("passage_changed") else "")
+
+
+def card_summary(card: dict, history: list, docs: dict, projects: list | None = None) -> dict:
     primary = card.get("primary") or {}
     doc = docs.get(primary.get("document_id") or "")
     # The card's Project document: its PDF's for a card made in an attachment.
@@ -684,6 +731,7 @@ def card_summary(card: dict, history: list, docs: dict) -> dict:
         notes = {k: v for k, v in (last.get("review_group_notes") or {}).items() if v}
         if notes:
             out["last_notes"] = notes
+    out.update(card_kind_fields(card, history, projects))
     return out
 
 
@@ -888,7 +936,10 @@ INSTRUCTIONS = (
     "review_cards and get_review_card show cards and the user's review history; use them to see what the user knows "
     "before explaining. Before explaining a concept or editing a passage on a topic the user may have studied, call "
     "knowledge_profile once for that topic and calibrate: skip or compress what is solid, explain shaky and not-understood "
-    "points carefully. create_review_card makes a card from a note's passage and move_review_card moves a card on an "
+    "points carefully. With few or no matching cards, its result also says what the user's cards show about them in "
+    "general (its learner section and the end of its summary): connect new material to what they know well and find "
+    "interesting. create_review_card makes a card from a note's passage (or a whole section, by its heading) and "
+    "move_review_card moves a card on an "
     "imported PDF into a note, only when the user asks; onto a pending proposal's proposed text it waits and moves the "
     "card when the user accepts that proposal (pending_card_moves lists such moves). To move a review card's marked "
     "passage (between its \\ReviewCardMaskStart/End or <!-- thoughts:v1:start/end review:... --> marker lines) "
@@ -910,7 +961,9 @@ INSTRUCTIONS = (
     "import_pdf adds a paper to a project from its URL (the Thoughts server downloads it, as Import document in the "
     "Library does): when the user asks to add a PDF, import it yourself instead of handing them a file to import; "
     "link it from a note with \\PdfLink{<its filename without .pdf>}{document-start}{text}. move_pdf moves an "
-    "imported PDF to another project. "
+    "imported PDF to another project. create_project makes a project with a docs folder of its own (add_source_folder "
+    "gives an existing project one), and move_note moves a note of a docs folder to another project with its review "
+    "cards, links and interactive pages, as Move to project on the Mac does; never re-create a note to move it. "
     "An interactive HTML page (sliders, a small simulation) lives in a note's docs-* folder: add it with add_html_page, "
     "then link it from the note in a create_proposals replacement, LaTeX \\href{thoughts-html:<path>}{text} or Markdown "
     "[text](thoughts-html:<path>); html_pages lists a folder's pages. A link to a page the folder lacks is refused. "
@@ -994,7 +1047,10 @@ def create_app(service: core.Service = SERVICE, thoughts_url: str = THOUGHTS_URL
         when the user closed it, the quoted passage, the user's comment, the page (html_attachment instead for an HTML page), and the PDF
         snapshot it was given on (snapshot "current" when that is the document's current PDF, "earlier" when the
         document was rebuilt since, so pages may have moved).
-        Feedback on review card answers is shown with the card (get_review_card), not here."""
+        Feedback on review card answers is shown with the card (get_review_card), not here.
+        A question is the user asking you something: answer it (in your reply or note); it is not a request to change
+        the document, so make no proposal for it unless the user asks for one. Likes and dislikes say what to keep and
+        what to change; a change goes in a proposal."""
         by_document = await thoughts.document_feedback()
         try:
             doc = await find(document_id)
@@ -1138,28 +1194,38 @@ def create_app(service: core.Service = SERVICE, thoughts_url: str = THOUGHTS_URL
         return result(f"{len(hits)} document(s):\n{text}", {"total": len(hits), "results": shown})
 
     @mcp.tool(name="review_cards", title="Review cards", annotations=readonly)
-    async def review_cards(query: str = "", document_id: str = "", state: str = "", limit: int = 30) -> CallToolResult:
+    async def review_cards(query: str = "", document_id: str = "", state: str = "", limit: int = 30,
+                           kind: str = "") -> CallToolResult:
         """The user's review cards, newest first: question, document, page, how often and how they last rated
         themselves (tags such as 'I get it' or 'Forgot'), and status: "active", "retired" with retired_at (the
         user took the card out of review but kept its history; it can be restored), or "unpublished" (its document
         is unpublished in its Project, so the card is kept but not offered for review until the document is
         published again). query filters by words in the question or document name; document_id by document; state
         by status ("active", "retired" or "unpublished"; default all).
+        Each card has review_kind: "knowledge" (material the user studies) or "project" (about work they are writing or
+        building, reviewed at least weekly; passage_changed says its passage changed since they last answered it), and
+        review_kind_source: "card" (chosen for the card), "project" (its Library Project's kind) or "default". kind
+        filters by review_kind ("knowledge" or "project"; default both).
         Deleted cards are left out. get_review_card has the answer and full history."""
         if state not in ("", "active", "retired", "unpublished"):
             raise ValueError('state must be "active", "retired", "unpublished" or empty')
+        if kind not in ("", "knowledge", "project"):
+            raise ValueError('kind must be "knowledge", "project" or empty')
         cards, events = await thoughts.review()
         docs = await thoughts.documents()
+        projects = await thoughts.projects()
         words = fold(query).split()
         rows = []
         for card_id, card in cards.items():
             history = events.get(card_id, [])
             if deleted(history):
                 continue
-            summary = card_summary(card, history, docs)
+            summary = card_summary(card, history, docs, projects)
             if document_id and summary["document_id"] != document_id:
                 continue
             if state and summary["status"] != state:
+                continue
+            if kind and summary.get("review_kind", "knowledge") != kind:
                 continue
             if words and not all(w in fold(f"{summary['question'] or ''} {summary['document'] or ''}") for w in words):
                 continue
@@ -1170,6 +1236,7 @@ def create_app(service: core.Service = SERVICE, thoughts_url: str = THOUGHTS_URL
                          + (f", last {r['last_reviewed_at'][:10]}: {', '.join(r['last_tags']) or r['last_rating']}" if r.get("last_reviewed_at") else "")
                          + (f", retired {r['retired_at'][:10]}" if r.get("retired_at") else "")
                          + (", unpublished document" if r["status"] == "unpublished" else "")
+                         + kind_text(r)
                          + f" (card {r['card_id']})" for r in shown)
         return result(f"{len(rows)} card(s):\n{text}", {"total": len(rows), "cards": shown})
 
@@ -1187,27 +1254,32 @@ def create_app(service: core.Service = SERVICE, thoughts_url: str = THOUGHTS_URL
     @mcp.tool(name="get_review_card", title="Review card with answer", annotations=readonly)
     async def get_review_card(card_id: str) -> CallToolResult:
         """One review card: question, answer (the marked passage of its source, or the PDF text it selected),
-        status ("active", or "retired" with retired_at) and every review with its tags and notes; retiring,
-        restoring and undoing a retirement appear in the history as action retire, restore and undo_retire.
+        status ("active", or "retired" with retired_at), review_kind ("knowledge" or "project", with
+        review_kind_source and, for a project card, passage_changed) and every review with its tags and notes;
+        retiring, restoring and undoing a retirement appear in the history as action retire, restore and undo_retire,
+        and choosing the card's kind as action set_review_kind with review_kind.
         pending_moves lists the card's moves onto a pending proposal's text (move_review_card), waiting or settled."""
         cards, events = await thoughts.review()
         if card_id not in cards:
             raise LookupError(f"no review card {card_id!r}")
         history = events.get(card_id, [])
-        summary = card_summary(cards[card_id], history, await thoughts.documents())
+        summary = card_summary(cards[card_id], history, await thoughts.documents(), await thoughts.projects())
         answer = await thoughts.card_answer(cards[card_id])
         summary.update(answer=answer, deleted=deleted(history), history=[
             {("action" if k == "queue_action" else k): e.get(k)
-             for k in ("reviewed_at", "rating", "queue_action", "review_tags", "review_group_notes") if e.get(k)}
+             for k in ("reviewed_at", "rating", "queue_action", "review_kind", "review_tags", "review_group_notes")
+             if e.get(k)}
             for e in history])
         moves = await card_pending_moves(card_id)
         if moves is not None:
             summary["pending_moves"] = moves
         lines = [f"Q: {summary['question']}", f"Document: {summary['document']}, page {summary['page']}"
-                 + (f" (retired {summary['retired_at'][:10]})" if summary.get("retired_at") else ""),
+                 + (f" (retired {summary['retired_at'][:10]})" if summary.get("retired_at") else "")
+                 + kind_text(summary),
                  "A: " + (answer or "(a region of the PDF without text)")]
         lines += [pending_move_line(move) for move in moves or [] if move.get("state") == "waiting_for_proposal"]
-        lines += [f"{h.get('reviewed_at', '')[:10]} {h.get('rating') or h.get('action')}: {', '.join(h.get('review_tags', []))}"
+        lines += [f"{h.get('reviewed_at', '')[:10]} {h.get('rating') or h.get('action')}"
+                  + (f" {h['review_kind']}" if h.get("review_kind") else "") + f": {', '.join(h.get('review_tags', []))}"
                   + (f" — {h['review_group_notes']}" if h.get("review_group_notes") else "") for h in summary["history"]]
         return result("\n".join(lines), summary)
 
@@ -1217,6 +1289,7 @@ def create_app(service: core.Service = SERVICE, thoughts_url: str = THOUGHTS_URL
         project: Annotated[str | None, Field(max_length=2000, description="Only cards of this Library project (its name, case-insensitive).")] = None,
         document: Annotated[str | None, Field(max_length=2000, description="Only cards of this Library document: its PDF filename, name or document ID.")] = None,
         limit: Annotated[int, Field(strict=True, ge=1, le=200, description="At most this many matching cards are classified.")] = 40,
+        learner: Annotated[bool | None, Field(description="Include what all of the user's cards say about them in general (learner). Default: only when fewer than 3 cards match.")] = None,
     ) -> CallToolResult:
         """What the user knows about a topic, from their review cards (read-only).
 
@@ -1224,12 +1297,20 @@ def create_app(service: core.Service = SERVICE, thoughts_url: str = THOUGHTS_URL
         tags of its answers (the latest weighs most), lapses, interval length and how overdue it is.
         Retired cards (taken out of review, history kept) count with their history, are never overdue, and
         their reason ends with "retired"; deleted cards are left out.
+        A card the user came up with (an answer tagged "I came up with it") is solid whatever its schedule and
+        has own_idea true, reason "own idea (...)": the idea is theirs, so build on it and never explain it back.
         Returns counts, the cards per class (question, document and a one-line reason such as
         "last 3 answers: Correct, Memorized, Correct; interval 25 d"), a short plain-language summary,
         and the tag-to-level mapping used (the default mapping).
+        A card's signals give the tags of its last answer from the user's other tag groups, such as Interest
+        ("Very interesting") and Effort ("Studied"); the summary ends with how typical each one is.
+        When fewer than 3 cards match (or with learner), learner describes all of the user's cards: counts per
+        class, the documents studied most with their mix and typical interest, the groups' typical tags,
+        questions they know well and struggle with, and their latest liked and disliked answer passages.
         Call it once per topic before explaining or editing, then calibrate; never change cards because of it.
         """
-        profile = await knowledge.knowledge_profile(thoughts, topic=topic, project=project, document=document, limit=limit)
+        profile = await knowledge.knowledge_profile(thoughts, topic=topic, project=project, document=document, limit=limit,
+                                                    learner=learner, kinds=review_kinds())
         return result(json.dumps(profile, ensure_ascii=False), profile, error=profile.get("accepted") is False)
 
     @mcp.tool(name="link_conversation", title="Show this conversation on a review card",
@@ -1407,6 +1488,28 @@ def create_app(service: core.Service = SERVICE, thoughts_url: str = THOUGHTS_URL
         if response.status_code >= 400 or not isinstance(answer.get("text"), str):
             return {"text": None, "missing": "the Library has no note named agent-note-rules.md yet"}
         return {key: answer.get(key) for key in ("text", "sha256", "source_path", "revision", "updated_at")}
+
+    async def mental_model_page() -> dict:
+        try:
+            if MENTAL_MODEL_CAPABILITY not in ((await thoughts.ttl("health", "/v1/health")).get("capabilities") or []):
+                return {"text": None, "missing": "this Thoughts server does not serve the Mental Model yet"}
+            response = await thoughts.request("GET", "/v1/mental-model", refusals=True)
+        except ThoughtsError as error:
+            return {"text": None, "missing": str(error)}
+        answer = response.json()
+        if response.status_code >= 400 or not isinstance(answer.get("text"), str):
+            return {"text": None, "missing": "the Library has no note named mental-model.md yet"}
+        return {key: answer.get(key) for key in ("text", "sha256", "source_path", "revision", "updated_at")}
+
+    @mcp.tool(name="mental_model", title="The user's Mental Model", annotations=notes_ro)
+    async def mental_model() -> CallToolResult:
+        """The user's Mental Model: what they know well, their gaps, what loses them in an explanation, their own
+        words and notation, how they draw, and how to explain a new topic to them. It is written from their review
+        cards and feedback by Review > Mental Model > Refresh on the Mac and kept as the Library note mental-model.md,
+        the one copy every agent reads. Read it before explaining something, answering a technical question or
+        writing a note for the user, then follow it. Card citations link the card (thoughts-card:<card id>)."""
+        page = await mental_model_page()
+        return result(page.get("text") or f"Not available: {page.get('missing')}", page)
 
     @mcp.tool(name="note_rules", title="The user's answering rules", annotations=notes_ro)
     async def note_rules() -> CallToolResult:
@@ -1889,6 +1992,105 @@ def create_app(service: core.Service = SERVICE, thoughts_url: str = THOUGHTS_URL
         core.log(f"pdf moved: {body.get('filename')} {body.get('from_project')!r} -> {body.get('to_project')!r}")
         return result("\n".join(lines), body)
 
+    async def project_folders(payload: dict, what: str) -> tuple[dict | None, CallToolResult | None]:
+        """Run a thoughts-cli project-folder command; (answer, None) when accepted, else (None, the refusal)."""
+        try:
+            body = await asyncio.to_thread(proposal_client().run, payload)
+        except ThoughtsError as error:
+            return None, result(f"Nothing changed: {error}", {"accepted": False, "error_code": "not_allowed",
+                                                              "message": str(error)}, error=True)
+        if not body.get("accepted"):
+            state = f"it may or may not have {what}" if body.get("retryable") else "nothing changed"
+            return None, result(f"Not done ({body.get('error_code')}; {state}): {body.get('message')}", body,
+                                error=True)
+        if body.get("state") != "move_planned":
+            thoughts.catalogue = None
+            thoughts.cached.pop("sources", None)
+        return body, None
+
+    def folder_lines(body: dict) -> list[str]:
+        folders = body.get("source_folders") or []
+        return ["Its docs folders: " + ", ".join(f"{f['folder']} ({f['name']})" for f in folders)] if folders else []
+
+    @mcp.tool(name="create_project", title="Create a Library Project", annotations=move_tool)
+    async def create_project(
+        name: Annotated[str, Field(min_length=1, max_length=200, description="The new Project's name (no line breaks); no other Project may have it (case-insensitive).")],
+        request_id: Annotated[str, Field(pattern=UUID_FIELD, description="Fresh random UUID for this call. It names the Project (new:<request_id>), so a retry with the same request_id finds it and never creates a second one.")],
+        source_folder: Annotated[bool, Field(description="Give the Project a docs folder of its own (docs-<name>-<hex>), as Import folder on the Mac does: its notes can then have interactive HTML pages and agent figures, and notes of other Projects can move into it. False: only the hidden default folder.")] = True,
+        folder_name: Annotated[str | None, Field(default=None, min_length=1, max_length=200, description="The folder's label in the Library; default: the Project's name.")] = None,
+    ) -> CallToolResult:
+        """Create a new Library Project, when the user asks for one. By default it gets a docs folder of its own, so
+        notes can be moved into it with move_note and its notes can have interactive pages. A name another Project
+        has is refused (project_exists). The phone and Mac show it after their next Sync. To add notes, use
+        create_document (a new note) or move_note (an existing note of another Project)."""
+        payload = {"command": "create-project", "name": name, "request_id": request_id, "source_folder": source_folder}
+        if folder_name is not None:
+            payload["folder_name"] = folder_name
+        body, refused = await project_folders(payload, "been created")
+        if refused is not None:
+            return refused
+        core.log(f"project created: {body.get('project')!r} {body.get('project_id')}")
+        return result("\n".join([body["message"] + (" (replayed: already created by this request_id)"
+                                                    if body.get("replayed") else "")] + folder_lines(body)), body)
+
+    @mcp.tool(name="add_source_folder", title="Give a Project a docs folder of its own", annotations=move_tool)
+    async def add_source_folder(
+        project: Annotated[str, Field(min_length=1, max_length=512, description="The Project: its exact name or its id.")],
+        request_id: Annotated[str, Field(pattern=UUID_FIELD, description="Fresh random UUID for this call. Retry an uncertain call only with identical arguments and the same request_id; it never adds two folders.")],
+        name: Annotated[str | None, Field(default=None, min_length=1, max_length=200, description="The folder's label in the Library; default: the Project's name. Two folders of a Project cannot share a label.")] = None,
+    ) -> CallToolResult:
+        """Give an existing Project one more docs folder of its own (docs-<label>-<hex>, empty but for its
+        .ThoughtIgnore), as Import folder on the Mac does: for a Project that has only its default folder, so notes
+        can move into it and have interactive pages. Only when the user asks for it, or before moving notes into
+        such a Project (move_note also creates the folder by itself when the Project has none). The phone and Mac
+        show it after their next Sync."""
+        payload = {"command": "add-source-folder", "project": project, "request_id": request_id}
+        if name is not None:
+            payload["name"] = name
+        body, refused = await project_folders(payload, "been added")
+        if refused is not None:
+            return refused
+        core.log(f"source folder added: {body.get('folder')} to {body.get('project')!r}")
+        return result("\n".join([body["message"] + (" (replayed: already added by this request_id)"
+                                                    if body.get("replayed") else "")] + folder_lines(body)), body)
+
+    @mcp.tool(name="move_note", title="Move a note to another Project", annotations=move_tool)
+    async def move_note(
+        document: Annotated[str, Field(min_length=1, max_length=1024, description="The note (LaTeX or Markdown) to move: its document id, its source path (as read_source takes it) or its exact name.")],
+        project: Annotated[str, Field(min_length=1, max_length=512, description="The destination Project: its exact name or its id.")],
+        request_id: Annotated[str, Field(pattern=UUID_FIELD, description="Fresh random UUID for this call. Retry an uncertain call only with identical arguments and the same request_id; it never moves twice.")],
+        dry_run: Annotated[bool, Field(description="Only show what the move would do (files, links, pages, warnings); nothing moves.")] = False,
+        destination_path: Annotated[str | None, Field(default=None, min_length=1, max_length=900, description="Its path inside the destination's docs folder; default: the same as now (e.g. tex/source/x.tex). Give one when the answer says the path is taken.")] = None,
+    ) -> CallToolResult:
+        """Move a note of a docs folder to another Library Project, as Thoughts' Move to project does, when the user
+        asks to move or regroup notes. The note keeps its identity and PDF; its review cards and comments follow; the
+        files only it uses move and shared ones are copied; links to and from it are rewritten
+        (\\SourceLink <-> \\CrossSourceLink) in every note; its interactive pages (thoughts-html: links) are listed
+        in the new folder too; the style and bibliography it needs come along. A Project with only its default
+        folder gets a docs folder of its own with the move. Refused, with nothing moved: notes of a Project's default
+        folder (.thoughts/projects/...), a taken path (give destination_path), and moves that need files only the Mac
+        holds (needs_mac: the user moves it on the Mac). Use dry_run first when unsure. The phone and Mac see the
+        move after their next Sync."""
+        payload = {"command": "move-document", "document": document, "project": project, "request_id": request_id,
+                   "dry_run": dry_run}
+        if destination_path is not None:
+            payload["destination_path"] = destination_path
+        body, refused = await project_folders(payload, "moved")
+        if refused is not None:
+            return refused
+        lines = [body["message"] + (" (replayed: already moved by this request_id)" if body.get("replayed") else "")]
+        lines.append(f"{body['from']} -> {body['to']}" + (" (a new docs folder)" if body.get("creates_folder") else ""))
+        for item in body.get("files") or []:
+            lines.append(f"{item['action']}: {item['source']} -> {item['destination']}")
+        if body.get("edited_sources"):
+            lines.append("Links rewritten in: " + ", ".join(body["edited_sources"]))
+        if body.get("html_pages"):
+            lines.append("Interactive pages listed in the new folder: " + ", ".join(body["html_pages"]))
+        lines += [f"Warning: {w}" for w in body.get("warnings") or []]
+        if body.get("state") == "document_moved":
+            core.log(f"note moved: {body.get('from')} -> {body.get('to')}")
+        return result("\n".join(lines), body)
+
     import_tool = ToolAnnotations(readOnlyHint=False, destructiveHint=False, openWorldHint=True, idempotentHint=True)
 
     @mcp.tool(name="import_pdf", title="Import PDF into a Thoughts project", annotations=import_tool)
@@ -1957,7 +2159,7 @@ def create_app(service: core.Service = SERVICE, thoughts_url: str = THOUGHTS_URL
 
     @mcp.tool(name="html_pages", title="A folder's interactive HTML pages", annotations=readonly)
     async def html_pages(
-        folder: Annotated[str, Field(min_length=1, max_length=900, description="The docs-* source folder (e.g. docs-concepts-a6fe5d), a path in it, or a document id or name.")],
+        folder: Annotated[str, Field(min_length=1, max_length=900, description="The docs-* source folder (e.g. docs-notes-0a1b2c), a path in it, or a document id or name.")],
         path: Annotated[str, Field(default="", max_length=900, description="Optional: one page's path; its HTML is returned too.")] = "",
     ) -> CallToolResult:
         """The interactive HTML pages of a docs folder (self-contained .html files at <folder>/tex/support/html/,
@@ -1989,8 +2191,8 @@ def create_app(service: core.Service = SERVICE, thoughts_url: str = THOUGHTS_URL
 
     @mcp.tool(name="add_html_page", title="Add an interactive HTML page to a folder", annotations=page_tool)
     async def add_html_page(
-        folder: Annotated[str, Field(min_length=1, max_length=900, description="The docs-* folder of the note that will link the page (e.g. docs-concepts-a6fe5d), a path in it such as the note's source path, or the note's document id or name.")],
-        name: Annotated[str, Field(pattern=r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,122}$", description="File name of the page, letters, digits, '.', '_' and '-' (.html is added if missing), e.g. irt-middle-slope.")],
+        folder: Annotated[str, Field(min_length=1, max_length=900, description="The docs-* folder of the note that will link the page (e.g. docs-notes-0a1b2c), a path in it such as the note's source path, or the note's document id or name.")],
+        name: Annotated[str, Field(pattern=r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,122}$", description="File name of the page, letters, digits, '.', '_' and '-' (.html is added if missing), e.g. slope-explorer.")],
         html: Annotated[str, Field(min_length=1, max_length=20971520, description="The complete self-contained page (at most 20 MiB of UTF-8): scripts, styles, fonts, images and data embedded inline. The viewer allows no network access, forms, frames or storage.")],
         request_id: Annotated[str, Field(pattern=UUID_FIELD, description="Fresh random UUID for this call. Retry an uncertain call only with identical arguments.")],
         replace: Annotated[bool, Field(default=False, description="Replace a page of that name. Read it first with html_pages; without replace an existing page is refused (html_page_exists).")] = False,
@@ -2027,23 +2229,47 @@ def create_app(service: core.Service = SERVICE, thoughts_url: str = THOUGHTS_URL
     async def create_review_card(
         source: Annotated[str, Field(min_length=1, description="Source path from read_source: the main .tex or .md source of a Library document.")],
         expected_source_sha256: Annotated[str, Field(pattern=r"^[0-9a-f]{64}$", description="source_sha256 from read_source; a changed source is refused (source_conflict).")],
-        start_line: Annotated[LineBoundary, Field(description="One-based first complete source line of the answer.")],
-        end_line: Annotated[LineBoundary, Field(description="Exclusive end line of the continuous answer range.")],
-        question: Annotated[str, Field(min_length=1, max_length=500, description="The card's question; the selected passage is its answer.")],
+        question: Annotated[str, Field(min_length=1, max_length=500, description="The card's question; the selected passage (or section) is its answer.")],
         due_at: Annotated[str, Field(description="First review time as ISO 8601 with a timezone, for example 2026-11-05T09:00:00+01:00; now or later.")],
         request_id: Annotated[str, Field(pattern=UUID_FIELD, description="Fresh random UUID for this call; it becomes the card's ID. Retry an uncertain call only with identical arguments and the same request_id; it never makes a second card.")],
+        start_line: Annotated[LineBoundary | None, Field(description="One-based first complete source line of the answer. Omit it for a section card.")] = None,
+        end_line: Annotated[LineBoundary | None, Field(description="Exclusive end line of the continuous answer range. Omit it for a section card.")] = None,
+        section_line: Annotated[LineBoundary | None, Field(description="Section card: the one-based line of the section's heading (\\section, \\subsection or \\subsubsection, starred or not; in Markdown # to ######). Instead of start_line/end_line and section_heading.")] = None,
+        section_heading: Annotated[str | None, Field(min_length=1, max_length=500, description="Section card: the heading's text as read_source shows it, for example Results and discussion. Instead of section_line when only one heading reads so.")] = None,
+        kind: Annotated[Literal["knowledge", "project"] | None, Field(description="The card's kind: \"knowledge\" (material the user studies, long spaced repetition) or \"project\" (about work they are writing or building: reviewed at least weekly and again when its passage changes). Leave it out to use the kind of the note's Library Project (usually what the user wants).")] = None,
     ) -> CallToolResult:
         """Create a review card whose answer is a passage of one of the user's notes, as the Mac's Create card does.
-        Use it only when the user asks for a card. Read the note with read_source first and select complete lines:
-        whole paragraphs or blocks with text, in LaTeX inside the document body and outside figures, tables, math and
-        unclosed groups, in Markdown whole top-level blocks (a list entirely); not inside a pending proposal or another
-        card's passage. Thoughts marks the passage in the source with the card's markers (they do not change the PDF)
-        and saves the approved card in the same step; the card's PDF areas are placed when the note is next built, and
-        the phone and Mac show it after their next Sync. The card is due at due_at."""
-        return await card_command({"command": "create-review-card", "source": source,
-                                   "expected_source_sha256": expected_source_sha256, "start_line": start_line,
-                                   "end_line": end_line, "question": question, "due_at": due_at,
-                                   "request_id": request_id})
+        Use it only when the user asks for a card. Read the note with read_source first and select complete lines
+        (start_line, end_line): whole paragraphs or blocks with text, in LaTeX inside the document body and outside
+        figures, tables, math and unclosed groups, in Markdown whole top-level blocks (a list entirely); not inside a
+        pending proposal or another card's passage. Thoughts marks the passage in the source with the card's markers
+        (they do not change the PDF) and saves the approved card in the same step; the card's PDF areas are placed
+        when the note is next built, and the phone and Mac show it after their next Sync. The card is due at due_at.
+
+        Section card: when the user asks for a card of a whole section or subsection, name its heading with
+        section_line (or section_heading) instead of start_line/end_line, as the Mac's Add Review Card on a heading
+        does. The card then hides the section's body, from below the heading (after its \\label or anchor lines) to
+        just before the next heading of the same or a higher level (in LaTeX also \\appendix, the bibliography or
+        \\end{document}), across pages, with its figures; the heading stays visible as the cue. Cards already inside
+        the section stay as they are and are hidden with it (the result's section.wrapped_cards counts them); a card
+        whose passage runs past the section's end is refused (invalid_selection). \\paragraph headings run into their
+        text and are refused, as is a heading whose line goes on with text. The result's section gives the title,
+        kind and the body's lines. A thoughts-cli without section cards answers invalid_request."""
+        payload = {"command": "create-review-card", "source": source, "expected_source_sha256": expected_source_sha256,
+                   "question": question, "due_at": due_at, "request_id": request_id}
+        if kind:
+            payload["kind"] = kind
+        for name, value in (("start_line", start_line), ("end_line", end_line), ("section_line", section_line),
+                            ("section_heading", section_heading)):
+            if value is not None:
+                payload[name] = value
+        if (start_line is None) != (end_line is None) or (start_line is None) == (section_line is None and section_heading is None) \
+                or (section_line is not None and section_heading is not None):
+            message = ("Give either start_line and end_line (a passage) or one of section_line and section_heading "
+                       "(a section card).")
+            return result(f"Nothing was written (invalid_request): {message}",
+                          {"accepted": False, "error_code": "invalid_request", "message": message}, error=True)
+        return await card_command(payload)
 
     @mcp.tool(name="move_review_card", title="Move a review card", annotations=card_tool)
     async def move_review_card(
@@ -2126,10 +2352,10 @@ def create_app(service: core.Service = SERVICE, thoughts_url: str = THOUGHTS_URL
 
     @mcp.tool(name="merge_review_cards", title="Merge review cards into one", annotations=merge_tool)
     async def merge_review_cards(
-        card_ids: Annotated[list[CardId], Field(min_length=2, max_length=20, description="The cards to merge (card_id from review_cards or get_review_card): two or more cards of one document whose passages are marked in `source`.")],
-        source: Annotated[str, Field(min_length=1, description="Source path from read_source: the file that holds every card's markers.")],
-        expected_source_sha256: Annotated[str, Field(pattern=r"^[0-9a-f]{64}$", description="source_sha256 from read_source; a changed source is refused (source_conflict).")],
+        card_ids: Annotated[list[CardId], Field(min_length=2, max_length=20, description="The cards to merge (card_id from review_cards or get_review_card): two or more cards of one document whose passages are marked in `source`, or two or more cards of one imported PDF.")],
         request_id: Annotated[str, Field(pattern=UUID_FIELD, description="Fresh random UUID for this call. Retry an uncertain call only with identical arguments and the same request_id; it never merges twice.")],
+        source: Annotated[str | None, Field(min_length=1, description="Source path from read_source: the file that holds every card's markers. Leave it out for cards of an imported PDF.")] = None,
+        expected_source_sha256: Annotated[str | None, Field(pattern=r"^[0-9a-f]{64}$", description="source_sha256 from read_source; a changed source is refused (source_conflict). Leave it out for cards of an imported PDF.")] = None,
         keep_card_id: Annotated[CardId | None, Field(description="The card that stays, with its ID, schedule and review history; one of card_ids. Default: the one with the most reviews.")] = None,
         question: Annotated[str | None, Field(min_length=1, max_length=500, description="The merged card's question. Default: the cards' questions joined in reading order.")] = None,
     ) -> CallToolResult:
@@ -2142,14 +2368,21 @@ def create_app(service: core.Service = SERVICE, thoughts_url: str = THOUGHTS_URL
         with a deletion and an edit, or with proposals that move markers. Use it only when the user asked for these
         cards to be merged. Read the source with read_source first. The phone and Mac get the merge with their next
         Sync; the kept card's PDF areas are placed when the note is next built.
-        Returns kept_card_id, deleted_card_ids, card_order (reading order), question, passages and the source's new
-        source_sha256. Errors: merge_refused with the reason (cards of several documents or source files, a PDF-only
-        card, cards on different PDF versions, a card without answer areas yet), card_unavailable, source_conflict
-        (read the source again), invalid_source, request_conflict, not_supported (an older Thoughts server)."""
+        Cards of an imported PDF (no source; the answer is highlighted in the PDF) can be merged too: leave out source
+        and expected_source_sha256, and their areas become the kept card's areas, in reading order; the PDF is unchanged.
+        Returns kind (source or pdf), kept_card_id, deleted_card_ids, card_order (reading order), question, passages
+        (areas, for a PDF) and the source's new source_sha256 (null for a PDF). Errors: merge_refused with the reason
+        (cards of several documents or source files, cards of a note with cards of a PDF, cards on different PDF
+        versions, a card without answer areas yet), card_unavailable, source_conflict (read the source again),
+        invalid_source, invalid_request, request_conflict, not_supported (an older Thoughts server)."""
         def refused(code: str, message: str) -> CallToolResult:
             return result(f"Not merged ({code}; nothing changed): {message}",
                           {"accepted": False, "error_code": code, "message": message}, error=True)
 
+        if (source is None) != (expected_source_sha256 is None):
+            return refused("invalid_request", "give both source and expected_source_sha256 for cards marked in a "
+                           "note, or leave both out for cards of an imported PDF.")
+        pdf = source is None  # cards of an imported PDF: no source fields
         try:
             capabilities = (await thoughts.ttl("health", "/v1/health")).get("capabilities") or []
         except ThoughtsError as error:
@@ -2157,15 +2390,24 @@ def create_app(service: core.Service = SERVICE, thoughts_url: str = THOUGHTS_URL
         if MERGE_CAPABILITY not in capabilities:
             return refused("not_supported", f"this Thoughts server cannot merge review cards yet (it lacks "
                            f"{MERGE_CAPABILITY}); the user can merge them with Merge cards… in Thoughts on the Mac.")
+        if pdf and MERGE_PDF_CAPABILITY not in capabilities:
+            return refused("not_supported", f"this Thoughts server cannot merge cards of a PDF yet (it lacks "
+                           f"{MERGE_PDF_CAPABILITY}); the user can merge them with Merge cards… in Thoughts on the Mac.")
         try:
-            commands = load_thoughts_cli().client.COMMANDS
+            cli = load_thoughts_cli()
+            commands = cli.client.COMMANDS
         except ThoughtsError as error:
             return refused("not_available", str(error))
         if "merge-review-cards" not in commands:
             return refused("not_supported", "the thoughts-cli installed next to the connector cannot merge review cards "
                            "yet (it needs merge-review-cards); the user can merge them with Merge cards… in Thoughts on the Mac.")
-        payload = {"command": "merge-review-cards", "card_ids": card_ids, "source": source,
-                   "expected_source_sha256": expected_source_sha256, "request_id": request_id}
+        if pdf and not hasattr(getattr(cli, "card_merges", None), "is_pdf_merge"):
+            return refused("not_supported", "the thoughts-cli installed next to the connector cannot merge cards of a "
+                           "PDF yet (it needs thoughts-cli 1.8.0); the user can merge them with Merge cards… in Thoughts "
+                           "on the Mac.")
+        payload = {"command": "merge-review-cards", "card_ids": card_ids, "request_id": request_id}
+        if not pdf:
+            payload.update(source=source, expected_source_sha256=expected_source_sha256)
         if keep_card_id is not None:
             payload["keep_card_id"] = keep_card_id
         if question is not None:
@@ -2185,6 +2427,15 @@ def create_app(service: core.Service = SERVICE, thoughts_url: str = THOUGHTS_URL
         # The merged source and cards: read them fresh next time.
         thoughts.cached.pop("sources", None)
         thoughts.cached.pop("projections", None)
+        if body.get("kind") == "pdf":
+            core.log(f"review cards merged into {body['kept_card_id']} on {body['document']}: "
+                     f"{len(body['card_order'])} cards" + (" (replayed)" if body.get("replayed") else ""))
+            return result(
+                f"Merged {len(body['card_order'])} cards of {body['document']} into card {body['kept_card_id']}"
+                + (" (replayed: already merged by this request_id)" if body.get("replayed") else "")
+                + f": question \u201c{body['question']}\u201d, {body['passages']} area(s) on the PDF. Deleted: "
+                f"{', '.join(body['deleted_card_ids'])}. The kept card keeps its schedule and review history; nothing "
+                "in the PDF changed, and the phone and Mac show the merge after their next Sync.", body)
         lines = [f"Merged {len(body['card_order'])} cards of {body['document']} into card {body['kept_card_id']}"
                  + (" (replayed: already merged by this request_id)" if body.get("replayed") else "")
                  + f": question \u201c{body['question']}\u201d, {body['passages']} passage(s) marked in {body['source']} "
@@ -2227,7 +2478,17 @@ def create_app(service: core.Service = SERVICE, thoughts_url: str = THOUGHTS_URL
                   else f"Created card {body['card_id']} in {body['document']}, due {body['due_at']}")
                  + (" (replayed: already written by this request_id)" if body.get("replayed") else "")
                  + f"; its passage is marked in {body['source']} (new source_sha256 {body['source_sha256']}). "
-                 + "Its PDF areas are placed when the note is next built; the phone and Mac show it after their next Sync."]
+                 + "Its PDF areas are placed when the note is next built; the phone and Mac show it after their next Sync."
+                 + ({"project": " It is a project card", "knowledge": " It is a knowledge card"}[body["review_kind"]]
+                    + (" (its Project's kind)." if body.get("review_kind_source") == "project" else ".")
+                    if body.get("review_kind") in ("knowledge", "project") and not moved else "")]
+        if isinstance(body.get("section"), dict):
+            section = body["section"]
+            lines.append(f"It hides the {section.get('kind', 'section')} “{section.get('title')}” (lines "
+                         f"{section.get('start_line')}–{int(section.get('end_line', 1)) - 1} before the markers); the "
+                         "heading stays visible"
+                         + (f", and the {section['wrapped_cards']} card(s) inside it stay as they are"
+                            if section.get("wrapped_cards") else "") + ".")
         if (body.get("render_check") or {}).get("status") == "failed":
             lines.append(f"Warning: the rebuild could not be requested: {body['render_check'].get('message')}")
         core.log(f"review card: {body['state']} {body['card_id']} in {body['source']}")
